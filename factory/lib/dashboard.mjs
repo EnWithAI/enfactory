@@ -280,6 +280,9 @@ function ask(question) {
 }
 // ── waiting on a person: escalations, vendor requests, owner requests, with what to do ──
 let waiting = { at: 0, items: [], error: null };
+// Requests closed from here. `gh issue list --label` reads GitHub's search index, which can list a closed issue as open
+// for minutes, so the card would come back after "Mark done". Hidden for 15 min; by then the index has caught up.
+const closedHere = new Map();
 const section = (body, name) => body?.match(new RegExp(`## ${name}\\n([\\s\\S]*?)(?=\\n## |\\n> |$)`))?.[1]?.trim() ?? '';
 async function loadWaiting(force = false) {
   if (!force && Date.now() - waiting.at < 60e3) return waiting;
@@ -331,7 +334,8 @@ async function loadWaiting(force = false) {
       items.push({ kind: 'engagement', n: 0, title: es.awaiting === 'approval' ? `Approve the ${es.phase === 'proposal' ? 'proposal' : 'plan'} in the Client room` : 'The team is waiting for your reply in the Client room',
         url: '#client', since: last?.at ?? es.started, why: (last?.text ?? '').slice(0, 600), steps: ['Open the Client room (header button).', es.awaiting === 'approval' ? 'Read the document, then Approve, or reply with the changes you want.' : 'Answer the question.'], actions: [] });
     }
-    waiting = { at: Date.now(), items: items.sort((a, b) => String(a.since).localeCompare(String(b.since))), error: null };
+    for (const [k, at] of closedHere) if (Date.now() - at > 15 * 60e3) closedHere.delete(k);
+    waiting = { at: Date.now(), items: items.filter((i) => !closedHere.has(i.n)).sort((a, b) => String(a.since).localeCompare(String(b.since))), error: null };
   } catch (e) { waiting = { ...waiting, at: Date.now(), error: `Couldn't read GitHub: ${e.message.slice(0, 160)}` }; }
   return waiting;
 }
@@ -360,9 +364,9 @@ async function act({ n, action, text, amount, permanent }) {
   if (action === 'approve') await editLabels(repo, n, { add: ['sf-approved'] });
   else if (action === 'fulfil' || action === 'done') {
     if (!t) throw new Error(action === 'fulfil' ? 'Say what you did or found (e.g. "PASS on iPhone 15, iOS 18" or where you put the credential), so the org can act on it.' : 'Add a short note on what you changed.');
-    await closeIssue(repo, n, 'completed');
+    await closeIssue(repo, n, 'completed'); closedHere.set(n, Date.now());
   }
-  else if (action === 'decline') { if (!t) throw new Error('Say why you are declining, so the org can record it.'); await closeIssue(repo, n, 'not planned'); }
+  else if (action === 'decline') { if (!t) throw new Error('Say why you are declining, so the org can record it.'); await closeIssue(repo, n, 'not planned'); closedHere.set(n, Date.now()); }
   else if (action === 'pull') {
     const R = await import('./release.mjs');
     if (R.current()?.status !== 'active') throw new Error('There is no active release to pull it into.');
