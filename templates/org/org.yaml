@@ -33,6 +33,9 @@ capacity:
   poll_seconds: 60
   budget_usd_per_run: 5 # per agent run (claude --max-budget-usd)
   daily_budget_usd: 50 # dispatcher stops starting work beyond this
+  # Claude usage limits: pause before a window runs out, resume a minute after it resets (from each run's rate-limit report).
+  # Fractions of the window; set enabled: false to turn it off.
+  usage_pause: { enabled: true, five_hour: 0.85, seven_day: 0.95 }
 
 # Quality. Every failure gets a Correction of Errors (5 Whys, fishbone, action items implemented across the team).
 # A role that introduces replace_after_defects defects within window_days goes to a performance review (coach/upgrade/replace).

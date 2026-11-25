@@ -102,7 +102,8 @@ const commands = {
       : `${cfg.company.name} is running with no project yet. Start one in the dashboard Client room (or: sf engage --start). Ctrl-C to stop.`);
     if (paused()) console.log("Paused: no new work starts until you resume (dashboard, or sf resume).");
     for (;;) {
-      if (paused() && !d.draining) { await sleep(5000); continue; } // paused from the dashboard: start nothing, check again soon
+      try { (await import('./lib/usage.mjs')).check(loadConfig()); } catch (e) { console.error('usage:', e.message); } // pause near the Claude usage limit; resume after it resets
+      if (paused() && !d.draining) { await sleep(5000); continue; } // paused (by a person, or for the usage limit): start nothing, check again soon
       if (d.draining) { // people's approvals and vendor deliveries still go through while agents finish
         try { d.ticking = true; await d.tick(); } catch (e) { console.error('tick:', e.message); } finally { d.ticking = false; }
         await sleep(cfg.capacity.poll_seconds * 1000); continue;

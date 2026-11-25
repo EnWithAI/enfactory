@@ -9,9 +9,9 @@ export const p = (...parts) => path.join(HOME, ...parts);
 
 /** Paused by a person: the dispatcher starts no new work and runs no background jobs until resumed. Running agents finish. */
 export const paused = () => { try { return JSON.parse(readFileSync(p('.factory/paused.json'), 'utf8')); } catch { return null; } };
-export function setPaused(on, by = 'person') {
+export function setPaused(on, by = 'person', extra = {}) {
   mkdirSync(p('.factory'), { recursive: true });
-  if (on) writeFileSync(p('.factory/paused.json'), JSON.stringify({ since: new Date().toISOString(), by }));
+  if (on) writeFileSync(p('.factory/paused.json'), JSON.stringify({ since: new Date().toISOString(), by, ...extra }));
   else rmSync(p('.factory/paused.json'), { force: true });
 }
 

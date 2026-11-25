@@ -6,7 +6,8 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
 import { p, loadConfig, configured, paused, setPaused, agentFile, headcount, holderOf, teamOf } from './config.mjs';
-import { events, record, writeDoc, decide } from './memory.mjs';
+import { events, record, writeDoc, decide, kv } from './memory.mjs';
+const kvExtra = () => kv('budget-topups')[new Date().toISOString().slice(0, 10)] ?? 0; // spend the owner approved beyond today's budget
 import { runAgent } from './worker.mjs';
 import { createIssue, gh, humanComment, editLabels, closeIssue, MARK } from './tracker.mjs';
 import { tree as libraryTree } from './library.mjs';
@@ -180,7 +181,7 @@ function state() {
     hiredRoles: [...new Set(evs.filter((e) => e.type === 'hired' && e.team).map((e) => e.role))],
     stats: {
       costToday: runs.filter((e) => e.ts >= today).reduce((s, e) => s + (e.cost_usd ?? 0), 0),
-      costTotal: runs.reduce((s, e) => s + (e.cost_usd ?? 0), 0), budget: cfg.capacity.daily_budget_usd,
+      costTotal: runs.reduce((s, e) => s + (e.cost_usd ?? 0), 0), budget: (() => { const b = cfg.capacity.daily_budget_usd ?? 0, x = kvExtra(); return x ? `${b} + $${x} approved today` : b; })(),
       runs: runs.length, decisions: evs.filter((e) => e.type === 'decision').length, learnings: evs.filter((e) => e.type === 'learning').length,
       genesis: evs.some((e) => e.type === 'genesis_finished') ? 'done' : evs.some((e) => e.type === 'genesis_started') ? 'running' : 'not run',
     },
@@ -316,9 +317,26 @@ async function loadWaiting(force = false) {
   } catch (e) { waiting = { ...waiting, at: Date.now(), error: `Couldn't read GitHub: ${e.message.slice(0, 160)}` }; }
   return waiting;
 }
+/** The budget item, computed fresh (no GitHub call): shown while today's budget is used up. */
+async function withBudget(w) {
+  const B = await import('./budget.mjs'), st = B.status();
+  if (!st.exhausted) return w;
+  const item = { kind: 'budget', n: 'budget', title: `Today's budget is used up: $${st.spent.toFixed(2)} of $${st.limit.toFixed(2)}`, since: st.since ?? new Date().toISOString(),
+    why: `The org has stopped starting new work${st.extra ? ` (daily budget $${st.base}, plus $${st.extra} you approved today)` : ` (daily budget $${st.base})`}. Agents already running finish their stage. ` +
+      'Approve more and the org continues on its next pass, within a minute. Extra spend for today ends at midnight UTC; tick the box to raise the daily budget itself.',
+    spent: st.spent, base: st.base, extra: st.extra, limit: st.limit };
+  return { ...w, items: [item, ...w.items.filter((i) => i.kind !== 'budget')] };
+}
+
 /** A person acts on a waiting item from the dashboard. Their text is a human comment (no factory marker), so the org records it. */
-async function act({ n, action, text }) {
+async function act({ n, action, text, amount, permanent }) {
   const cfg = loadConfig(), repo = cfg.product.tracker, t = String(text ?? '').trim();
+  if (action === 'budget') { // approve more spend; the dispatcher picks it up on its next pass
+    const by = cfg.people?.find((x) => x.owner)?.login ?? 'owner';
+    (await import('./budget.mjs')).approve(amount, { permanent: !!permanent, by });
+    record('person_action', { action: 'budget', amount_usd: Number(amount), permanent: !!permanent }, { actor: by });
+    return withBudget(await loadWaiting());
+  }
   if (/(-----BEGIN|AKIA[0-9A-Z]{12}|ghp_[A-Za-z0-9]{20}|sk-[A-Za-z0-9]{20}|xox[bp]-)/.test(t)) throw new Error('That looks like a secret. Put it in the named secret store and only say where it is.');
   if (t) await humanComment(repo, n, t);
   if (action === 'approve') await editLabels(repo, n, { add: ['sf-approved'] });
@@ -361,7 +379,8 @@ function dispatcher() {
   const pid = existsSync(lock) ? Number(readFileSync(lock, 'utf8')) : 0;
   let running = false;
   if (pid) try { process.kill(pid, 0); running = true; } catch {}
-  return { running, pid: running ? pid : null, paused: paused(), log: '.factory/dispatcher.log' };
+  let usage = null; try { usage = JSON.parse(readFileSync(p('.factory/usage.json'), 'utf8')); } catch {} // Claude usage windows, from the latest agent run
+  return { running, pid: running ? pid : null, paused: paused(), usage, log: '.factory/dispatcher.log' };
 }
 /** start | pause | resume. Pausing stops new work and background jobs; agents already running finish their stage. */
 function controlDispatcher(action) {
@@ -453,11 +472,11 @@ export function serve(port = DEFAULT_PORT, { explicit = false } = {}) {
         }).catch((e) => { res.statusCode = 400; res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ error: e.message })); });
       }
       if (url.pathname === '/api/waiting') {
-        return loadWaiting().then((w) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(w)); });
+        return loadWaiting().then(withBudget).then((w) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(w)); });
       }
       if (url.pathname === '/api/act' && req.method === 'POST') {
         if (!trusted(req)) { res.statusCode = 403; res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify({ error: 'Refused: actions can only come from this dashboard.' })); }
-        return body(req).then((b) => act(JSON.parse(b || '{}'))).then((w) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(w)); })
+        return body(req).then((b) => act(JSON.parse(b || '{}'))).then(withBudget).then((w) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(w)); })
           .catch((e) => { res.statusCode = 400; res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ error: e.message })); });
       }
       if (url.pathname === '/api/asks') { res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify(recentAsks())); }

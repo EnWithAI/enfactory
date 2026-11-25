@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync } from 'node
 import { randomUUID } from 'node:crypto';
 import { HOME, p, compileAgents } from './config.mjs';
 import { record, saveRun } from './memory.mjs';
+import { save as saveUsage } from './usage.mjs';
 
 const constitution = () => readFileSync(p('CLAUDE.md'), 'utf8');
 const readIf = (f) => { try { return readFileSync(f, 'utf8'); } catch { return ''; } };
@@ -135,6 +136,7 @@ function runOnce({ cfg, role, prompt, schema, cwd = HOME, issue = null, label = 
         const line = buf.slice(0, i); buf = buf.slice(i + 1);
         let ev; try { ev = JSON.parse(line); } catch { continue; }
         if (ev.type === 'result') res = ev;
+        else if (ev.type === 'rate_limit_event') { try { saveUsage(ev.rate_limit_info); } catch { /* usage is advisory */ } }
         else if (ev.type === 'assistant') for (const b of ev.message?.content ?? []) live.push(describe(b));
       }
     });

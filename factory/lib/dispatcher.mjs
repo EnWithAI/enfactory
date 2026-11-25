@@ -10,6 +10,7 @@ import { council } from './council.mjs';
 import { report } from './report.mjs';
 import * as R from './repos.mjs';
 import { recordAnswer } from './discovery.mjs';
+import { decideDeploy, probeHealth } from './deploy-gate.mjs';
 
 const now = () => new Date();
 const sh = promisify(execFile);
@@ -46,7 +47,9 @@ export class Dispatcher {
         no_code_change: { type: 'boolean', description: 'true only when the tech design explicitly calls for no product-repo change (e.g. a factory, memory or doc-only change). The issue then goes through review and security without a PR and closes at merge.' },
       },
       'tech-grooming': { risk_tier: { enum: ['low', 'medium', 'high'] }, repos: { type: 'array', items: { enum: names }, description: 'Every repo this change touches.' } },
-      release: { deploy_now: { type: 'boolean' }, environment: { enum: this.envs }, hold_minutes: { type: 'number' } },
+      release: { deploy_now: { type: 'boolean' }, environment: { enum: this.envs }, hold_minutes: { type: 'number' },
+        no_runtime_surface: { type: 'boolean', description: 'true only when the touched repos have nothing to run in this environment (e.g. docs, design tokens with no build, lint config). Skips deploy and the health probe; requires no_runtime_note. Otherwise deploy_now must deploy and pass the health probe, or the release is held.' },
+        no_runtime_note: { type: 'string', description: 'Required with no_runtime_surface: why this change has nothing to deploy or probe (at least 20 characters). Recorded in the ledger.' } },
       verify: { incidents: { type: 'array', items: INCIDENT() }, rollback: { type: 'boolean', description: 'true if users are affected now and the environment must go back to its last verified release' } },
       incident: { priority: { enum: ['P0', 'P1', 'P2', 'P3'] } },
     }[stage] ?? {}) };
@@ -80,7 +83,7 @@ export class Dispatcher {
     const eng = (await import('./engagement.mjs')).state();
     if (!this.cfg.product?.tracker || (eng && eng.phase !== 'delivery')) { await this.syncMemory(); return; }
     const { cfg } = this;
-    const budgetLeft = (cfg.capacity.daily_budget_usd ?? Infinity) - this.spentToday();
+    const budget = (await import('./budget.mjs')).status(cfg), budgetLeft = budget.left; // includes today's approved extra
     const issues = await T.listIssues(this.repo, cfg.product.intake_label);
     const waitingNow = {};
     if (Date.now() - (this.answersAt ?? 0) > 120e3) { // owner answers on GitHub → answers.md (every 2 minutes)
@@ -104,7 +107,7 @@ export class Dispatcher {
     }
     // Current spend, where agents can read it (feedback d17f145f): spend-based rules in a plan can be checked, not guessed.
     const relIssues = new Set(rel?.issues ?? []);
-    this.spend = { today_usd: +(cfg.capacity.daily_budget_usd - budgetLeft).toFixed(2), daily_budget_usd: cfg.capacity.daily_budget_usd ?? null,
+    this.spend = { today_usd: budget.spent, daily_budget_usd: budget.limit, extra_today_usd: budget.extra,
       release: rel?.number ?? null, release_usd: +M.events().filter((e) => e.type === 'run_finished' && relIssues.has(Number(e.issue))).reduce((s, e) => s + (e.cost_usd ?? 0), 0).toFixed(2),
       at: now().toISOString() };
     M.kv('spend', this.spend);
@@ -166,7 +169,11 @@ export class Dispatcher {
       const role = this.pickRole(stage, st, state);
       const person = holderOf(cfg, role);
       if (person) { await this.guard(n, () => this.toPerson(issue, stage, role, person, state)); continue; } // a person holds this role
-      if (budgetLeft <= 0) { if (!this.budgetWarned) console.log('daily budget reached, no new work started'); this.budgetWarned = true; continue; }
+      if (budgetLeft <= 0) { // out of budget: the owner approves more from "Waiting on you" and work continues on the next pass
+        if (!this.budgetWarned) { console.log(`daily budget reached ($${budget.spent} of $${budget.limit}), no new work started`); (await import('./budget.mjs')).noteExhausted(budget); }
+        this.budgetWarned = true; continue;
+      }
+      this.budgetWarned = false;
       if (this.running.size >= (cfg.capacity.max_parallel ?? 10)) continue;
       if (this.busy(role) >= headcount(cfg, role)) { // seats full: note the wait; long waits go to the CFO
         const q = (waitingNow[role] ??= this.queue[role] ?? { since: Date.now(), issues: [] });
@@ -468,29 +475,35 @@ export class Dispatcher {
       }
       if (ci.status === 'timeout') M.record('ci_wait_timeout', { stage, table: ci.table.slice(0, 1000) }, { issue: n }); // merge still enforces green
     }
-    if (stage === 'release') {
-      if (v.deploy_now) {
-        const env = v.environment ?? this.nextEnv(state);
-        const failed = [];
-        for (const r of this.touched(state).filter((r) => r.deploy_workflow || r.deploy_command)) {
-          const out = await this.deploy(r, env);
-          M.record('deploy', { repo: r.name, env, via: r.deploy_command ? 'local' : 'workflow', ok: out.ok, risk: state.risk, log: out.log.slice(-1500) }, { actor: role, issue: n });
-          if (!out.ok) failed.push(`${r.name}:\n${out.log.slice(-2500)}`);
-        }
-        if (failed.length) { // deploy failed (and rolled back) → the engineer gets the log
-          next = 'build'; state.loops += 1;
-          v.handoff = `Deploy to ${env} failed and was rolled back. Fix it:\n\`\`\`\n${failed.join('\n')}\n\`\`\``;
-          state.lastHandoff = { from: 'release', by: 'deploy', text: v.handoff };
-          await T.comment(repo, n, `### 🔁 Deploy to \`${env}\` failed and rolled back, requeued to \`build\`\n\`\`\`\n${failed.join('\n').slice(-3000)}\n\`\`\``);
-          this.coe({ issue: n, kind: 'deploy_failure', from: 'release', to: 'build', by: 'deploy', reason: v.handoff.slice(0, 3000) });
-        } else {
-          state.deployed = { ...state.deployed, [env]: now().toISOString() };
-          state.lastEnv = env;
-          await T.comment(repo, n, `### 🚀 Deployed to \`${env}\`\n${this.touched(state).map((r) => `- ${r.name}: ${r.health?.[env] || r.deploy_workflow}`).join('\n')}`);
-        }
-      } else {
+    if (stage === 'release' && next !== 'blocked') {
+      // Deployed means the deploy step exited 0 AND the health URL answered 200 (feedback 2fa9b900: a repo with no deploy
+      // config used to fall out of the loop, so staging was marked deployed and the issue moved to verify with nothing running).
+      const env = v.environment ?? this.nextEnv(state);
+      const d = await decideDeploy({ verdict: v, repos: this.touched(state), env, runDeploy: (r, e) => this.deploy(r, e), probe: (u) => probeHealth(u) });
+      for (const [type, data] of d.events) M.record(type, { ...data, risk: state.risk }, { actor: type === 'deploy' ? role : 'deploy', issue: n });
+      if (d.status === 'deployed') {
+        state.deployed = { ...state.deployed, [env]: now().toISOString() };
+        state.lastEnv = env;
+        await T.comment(repo, n, `### 🚀 Deployed to \`${env}\` (deploy exited 0, health 200)\n${this.touched(state).map((r) => `- ${r.name}: ${r.health[env]}`).join('\n')}`);
+      } else if (d.status === 'no_runtime') { // nothing to run: the env is passed, not deployed, so verify and promotion still work
+        state.noRuntime = { ...state.noRuntime, [env]: now().toISOString() };
+        state.lastEnv = env;
+        await T.comment(repo, n, `### ⏭️ No deploy to \`${env}\`: the release manager declared no runtime surface\n> ${d.detail.replaceAll('\n', '\n> ')}`);
+      } else { // a hold, whether the agent chose it or the gate forced it; never verify
         next = 'release';
         state.holdUntil = new Date(Date.now() + (v.hold_minutes ?? 60) * 60e3).toISOString();
+        if (d.status === 'hold') {
+          const text = `The release was held: nothing was deployed to ${env} (${d.reason}).\n${d.detail}${d.log ? `\n\`\`\`\n${d.log.slice(-2500)}\n\`\`\`` : ''}\n` +
+            `If the deploy config is missing, file it as a blocking follow-up or a vendor request; if a deploy failed, route the log to build. ` +
+            `If this change truly has nothing to run, return no_runtime_surface: true with a no_runtime_note that says why.`;
+          state.lastHandoff = { from: 'release', by: 'deploy', text };
+          if (d.next !== 'release') { // the verdict's transition is already on the record; this one overrides it
+            state.history.push({ ts: now().toISOString(), stage, to: 'release', outcome: 'hold', by: 'deploy' });
+            M.record('transition', { stage, to: 'release', outcome: 'hold', loop: false, loops: state.loops, kind: 'deploy_gate', summary: `Held at release: nothing deployed to ${env} (${d.reason})` }, { actor: 'deploy', issue: n });
+          }
+          await T.comment(repo, n, `### ⏸️ Release held: nothing was deployed to \`${env}\` (${d.reason})\n${d.detail}${d.log ? `\n\`\`\`\n${d.log.slice(-2500)}\n\`\`\`` : ''}`);
+          if (['failed', 'unhealthy'].includes(d.reason)) this.coe({ issue: n, kind: 'deploy_failure', from: 'release', to: 'release', by: 'deploy', reason: text.slice(0, 3000) });
+        }
       }
     }
     if (stage === 'verify') {
@@ -804,9 +817,12 @@ export class Dispatcher {
 
   /** Deploy one repo to one environment: a GitHub Actions workflow (cloud) or a local command (this machine). */
   async deploy(r, env) {
-    if (!r.deploy_command) {
-      await T.runWorkflow(r.repo, r.deploy_workflow, r.default_branch, { environment: env });
-      return { ok: true, log: `dispatched ${r.deploy_workflow} (${env})` };
+    if (!r.deploy_command) { // dispatching only queues the run; the deploy has "exited 0" when the run concludes success
+      const since = now();
+      try { await T.runWorkflow(r.repo, r.deploy_workflow, r.default_branch, { environment: env }); }
+      catch (e) { return { ok: false, log: `could not dispatch ${r.deploy_workflow} (${env}): ${e.message}` }; }
+      const w = await T.waitWorkflow(r.repo, r.deploy_workflow, since);
+      return { ok: w.ok, log: `${r.deploy_workflow} (${env}): ${w.conclusion}${w.url ? ` ${w.url}` : ''}` };
     }
     const base = await R.ensureBase(r); // fresh checkout of the default branch
     const cmd = r.deploy_command.replaceAll('{name}', r.name).replaceAll('{env}', env).replaceAll('{port}', String(r.ports?.[env] ?? ''));
@@ -819,7 +835,8 @@ export class Dispatcher {
 
   repoByName(name) { return this.repos.find((r) => r.name === name); }
   prList(state) { return Object.entries(state.prs ?? {}).map(([name, pr]) => `${this.repoByName(name).repo}#${pr}`).join(', '); }
-  nextEnv(state) { return this.envs.find((e) => !state.deployed?.[e]) ?? this.envs.at(-1); }
+  // An environment passed with no_runtime_surface counts as done for promotion, without ever being marked deployed.
+  nextEnv(state) { return this.envs.find((e) => !state.deployed?.[e] && !state.noRuntime?.[e]) ?? this.envs.at(-1); }
 
   /** Push each touched repo that has commits and open/update its PR. */
   async publish(issue, state, v) {
@@ -967,8 +984,11 @@ export class Dispatcher {
       dossier.artifacts.length ? `- Every artifact (older versions too): ${dossier.artifacts.map((a) => p(a)).join(', ')}` : '',
       `- \`sf recall "<keywords>"\` for decisions and learnings from other issues.`,
       st.workspace ? `\n## Workspace (cwd: ${cwd})\nOne sub-folder per repo, each a git worktree on branch \`sf/issue-${n}\`:\n${this.touched(state).map((r) => `- \`${r.name}/\`: ${r.repo} (base \`origin/${r.default_branch}\`)`).join('\n')}\nOnly change repos the tech design names. If another repo must change, loop back to tech-grooming.` : '',
-      stage === 'release' ? `\n## Go-live policy\n${cfg.release.policy}\nEnvironments in order: ${this.envs.join(' → ')}. Already deployed: ${JSON.stringify(state.deployed ?? {})}. The next one is **${this.nextEnv(state)}**.\nRecent deploys:\n${this.touched(state).filter((r) => r.deploy_workflow).map((r) => `- \`gh run list -R ${r.repo} --workflow ${r.deploy_workflow} --limit 10\``).join('\n')}` : '',
-      stage === 'verify' ? `\n## Validate ${state.lastEnv ?? 'the deploy'} (deployed ${state.deployed?.[state.lastEnv] ?? '?'})\n${this.profile(state.lastEnv) ? `You have read-only AWS access (profile \`${this.profile(state.lastEnv)}\`, region ${cfg.aws?.region}). Start with \`aws sts get-caller-identity --profile ${this.profile(state.lastEnv)}\`.` : 'This environment runs on the local machine. Use the health URLs and the deploy log.'}\n` +
+      stage === 'release' ? `\n## Go-live policy\n${cfg.release.policy}\nEnvironments in order: ${this.envs.join(' → ')}. Already deployed: ${JSON.stringify(state.deployed ?? {})}. The next one is **${this.nextEnv(state)}**.${Object.keys(state.noRuntime ?? {}).length ? ` Passed with no runtime surface: ${JSON.stringify(state.noRuntime)}.` : ''}\n` +
+        `Deploy config for ${this.nextEnv(state)}:\n${this.touched(state).map((r) => `- ${r.name}: deploy ${r.deploy_command ? `\`${r.deploy_command}\`` : r.deploy_workflow || '(none configured)'}, health ${r.health?.[this.nextEnv(state)] || '(none configured)'}`).join('\n')}\n` +
+        `The dispatcher marks the environment deployed only if every repo's deploy exits 0 and its health URL answers 200; otherwise the release is held whatever you choose. ` +
+        `If the change has nothing to run (no build, no server, no bundle change), set \`no_runtime_surface: true\` with a \`no_runtime_note\` saying why, and no deploy or probe runs.\nRecent deploys:\n${this.touched(state).filter((r) => r.deploy_workflow).map((r) => `- \`gh run list -R ${r.repo} --workflow ${r.deploy_workflow} --limit 10\``).join('\n')}` : '',
+      stage === 'verify' ? `\n## Validate ${state.lastEnv ?? 'the deploy'} (${state.deployed?.[state.lastEnv] ? `deployed ${state.deployed[state.lastEnv]}` : state.noRuntime?.[state.lastEnv] ? `not deployed: the release manager declared no runtime surface at ${state.noRuntime[state.lastEnv]}; confirm nothing needed to run` : 'deployed ?'})\n${this.profile(state.lastEnv) ? `You have read-only AWS access (profile \`${this.profile(state.lastEnv)}\`, region ${cfg.aws?.region}). Start with \`aws sts get-caller-identity --profile ${this.profile(state.lastEnv)}\`.` : 'This environment runs on the local machine. Use the health URLs and the deploy log.'}\n` +
         `Health URLs:\n${this.touched(state).map((r) => `- ${r.name}: ${r.health?.[state.lastEnv] || '(none configured)'}`).join('\n')}\nSignals:\n${this.signals(state.lastEnv, this.touched(state)).map((s) => `- \`${s}\``).join('\n')}\n` +
         `Environments: ${this.envs.join(' → ')}. If ${state.lastEnv} is healthy and it isn't the last environment, choose \`release\` to promote. If it is the last, choose \`done\`. A regression goes to \`build\`, and if users are impacted, say "rollback" in decisions.` : '',
       `\n## How to work`,

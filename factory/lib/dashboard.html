@@ -406,6 +406,14 @@ dialog::backdrop { background: var(--scrim); }
 .spend-body .down { color: var(--ok); } .spend-body .up { color: var(--err); }
 /* first-run setup */
 #setupbox { width: min(760px, 100vw - 32px); }
+/* confirmations and notices, in the dashboard's own style instead of the browser's */
+#confirmbox { width: min(440px, 100vw - 32px); }
+#confirmbox .cbwrap { padding: 20px 24px 22px; display: flex; flex-direction: column; gap: 10px; }
+#confirmbox h2 { margin: 0; font-size: 17px; }
+#confirmbox p { margin: 0; color: var(--fg-2); font-size: 14px; line-height: 1.5; }
+#confirmbox .wactions { justify-content: flex-end; margin-top: 10px; }
+#confirmbox.danger .wactions button.primary { background: var(--err); color: var(--surface); }
+#confirmbox [hidden] { display: none; } /* .wactions buttons use all: unset, which would otherwise override hidden */
 .setwrap { padding: 16px 24px 24px; display: flex; flex-direction: column; gap: 18px; }
 .setwrap h3 { margin: 0 0 8px; font-size: 14px; }
 .checks { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
@@ -426,6 +434,7 @@ dialog::backdrop { background: var(--scrim); }
   <div class="kpi"><b id="k-cost">$0</b><span>Spent today</span></div>
   <div class="kpi"><b id="k-runs">0</b><span>Agent runs</span></div>
   <div class="kpi"><b id="k-dec">0</b><span>Decisions</span></div>
+  <div class="kpi" id="k-usage-box" hidden><b id="k-usage">–</b><span>Claude session</span></div>
   <a class="waitpill" id="wait-pill" href="#waiting" hidden></a>
   <button type="button" class="askbtn ghost" id="run-org" hidden>Pause</button>
   <button type="button" class="askbtn" id="cr-open">Client room<span id="cr-badge" hidden>your turn</span></button>
@@ -532,6 +541,10 @@ dialog::backdrop { background: var(--scrim); }
     <div class="wactions"><button type="submit" class="primary">File it</button><span class="msg" id="fb-msg" role="status" aria-live="polite"></span></div>
   </form>
   <div id="fb-list" class="fblist"></div>
+</div></dialog>
+<dialog id="confirmbox" aria-labelledby="cb-title" aria-describedby="cb-body"><div class="cbwrap">
+  <h2 id="cb-title"></h2><p id="cb-body"></p>
+  <div class="wactions"><button type="button" id="cb-cancel">Cancel</button><button type="button" class="primary" id="cb-ok">OK</button></div>
 </div></dialog>
 <dialog id="setupbox" aria-labelledby="set-title"><div class="reader-head"><b id="set-title">Set up your factory</b></div>
 <div class="setwrap">
@@ -855,6 +868,28 @@ function renderWaiting(w) {
   $('wlist').replaceChildren(...items.map((i) => {
     if (i.kind === 'engagement') return el('article', { class: 'witem' }, el('h3', {}, el('span', { class: 'pill info' }, 'Client room'), i.title),
       el('div', { class: 'why' }, i.why), el('div', { class: 'todo' }, el('button', { type: 'button', class: 'askbtn', onclick: () => $('cr-open').click() }, 'Open the Client room')));
+    if (i.kind === 'budget') {
+      const amt = el('input', { id: 'bud-amt', type: 'number', min: '1', max: '1000', step: '1', value: String(Math.max(10, Math.round(i.base / 4))), style: 'width:90px' });
+      const perm = el('input', { id: 'bud-perm', type: 'checkbox' });
+      const msg = el('span', { class: 'msg', role: 'status', 'aria-live': 'polite' });
+      const approve = async (amount, btn) => {
+        const btns = btn.parentElement.parentElement.querySelectorAll('button'); btns.forEach((b) => { b.disabled = true; });
+        msg.className = 'msg'; msg.textContent = 'Approving…';
+        try {
+          const r = await fetch('/api/act', { method: 'POST', headers: { 'content-type': 'application/json', 'x-factory-ask': '1' }, body: JSON.stringify({ action: 'budget', amount, permanent: perm.checked }) });
+          const j = await r.json(); if (!r.ok) throw new Error(j.error ?? 'refused');
+          waitSig = ''; renderWaiting(j); refresh();
+        } catch (err) { msg.className = 'msg err'; msg.textContent = `${err.message}. Nothing was changed.`; btns.forEach((b) => { b.disabled = false; }); }
+      };
+      const quick = [20, 50, 100].map((a) => el('button', { type: 'button', onclick: (e) => approve(a, e.currentTarget) }, `+$${a}`));
+      const go = el('button', { type: 'button', class: 'primary', onclick: (e) => approve(Number(amt.value), e.currentTarget) }, 'Approve');
+      return el('article', { class: 'witem', 'aria-labelledby': 'wt-budget' },
+        el('h3', { id: 'wt-budget' }, el('span', { class: 'pill warn' }, 'Budget'), i.title, el('span', { class: 'muted', style: 'font-size:12px;font-weight:600' }, `waiting ${ago(i.since)}`)),
+        el('div', { class: 'why' }, i.why),
+        el('div', { class: 'todo' }, el('h4', {}, 'Approve more spend'),
+          el('div', { class: 'wactions' }, ...quick, el('label', { for: 'bud-amt', class: 'muted', style: 'font-size:13px' }, 'or $'), amt, go),
+          el('div', { class: 'wactions' }, el('label', { style: 'font-size:13px;display:flex;gap:6px;align-items:center' }, perm, `Raise the daily budget permanently (now $${i.base})`), msg)));
+    }
     if (i.done) return el('article', { class: 'witem done' }, el('p', {}, `✓ You approved #${i.n} ${i.title}. The org resumes it on its next pass (within a minute) and it leaves this list.`));
     const why = el('div', { class: 'why' });
     why.innerHTML = window.marked && window.DOMPurify ? DOMPurify.sanitize(marked.parse(i.why || '')) : '';
@@ -1384,6 +1419,26 @@ $('set-form').onsubmit = async (e) => {
   } catch (err) { $('set-msg').textContent = err.message; $('set-go').disabled = false; }
 };
 
+// ── themed confirm and notice (the browser's own confirm/alert don't match the dashboard) ──
+// Resolves true for OK, false for Cancel, Escape or a click outside. A notice has only an OK button.
+function confirmBox({ title, body = '', ok = 'OK', cancel = 'Cancel', danger = false, notice = false }) {
+  const box = $('confirmbox');
+  $('cb-title').textContent = title; $('cb-body').textContent = body;
+  $('cb-ok').textContent = ok; $('cb-cancel').textContent = cancel; $('cb-cancel').hidden = notice;
+  box.classList.toggle('danger', danger);
+  return new Promise((resolve) => {
+    const done = (v) => { box.removeEventListener('close', onClose); if (box.open) box.close(); resolve(v); };
+    const onClose = () => done(false);
+    $('cb-ok').onclick = () => done(true);
+    $('cb-cancel').onclick = () => done(false);
+    box.onclick = (e) => { if (e.target === box) done(false); }; // backdrop
+    box.addEventListener('close', onClose);
+    box.showModal();
+    (notice ? $('cb-ok') : $('cb-cancel')).focus(); // the safe choice has focus
+  });
+}
+const noticeBox = (title, body) => confirmBox({ title, body, notice: true });
+
 // ── is the org working? The dispatcher hands out work; Pause stops new work, Resume (or Start) gets it going again. ──
 let orgAction = null, orgBusy = false;
 async function loadDispatcher() {
@@ -1397,13 +1452,27 @@ async function loadDispatcher() {
     : d.paused ? ['resume', 'Paused · Resume', 'askbtn stopped', `Paused since ${new Date(d.paused.since).toLocaleString()}. No new work starts until you resume.`]
     : ['pause', 'Pause', 'askbtn ghost', 'Stop starting new work. Agents already running finish their current stage.'];
   orgAction = action; b.textContent = text; b.className = cls; b.title = title;
+  // Paused for the Claude usage limit: say why and when it resumes on its own (Resume still works now).
+  if (d.running && d.paused?.by === 'usage-limit') {
+    const at = new Date(d.paused.resumeAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    b.textContent = `Paused: ${d.paused.reason} · resumes ${at}`;
+    b.title = `The factory paused itself near the Claude usage limit and resumes on its own at ${new Date(d.paused.resumeAt).toLocaleString()}. Click to resume now.`;
+  }
+  // Claude usage: the 5-hour session window, with the 7-day window in the tooltip.
+  const w = d.usage?.windows ?? {}, five = w.five_hour, week = w.seven_day;
+  $('k-usage-box').hidden = five?.utilization == null;
+  if (five?.utilization != null) {
+    const pct = (x) => `${Math.round(x.utilization * 100)}%`, when = (x) => new Date(x.resetsAt * 1000).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' });
+    $('k-usage').textContent = pct(five);
+    $('k-usage-box').title = `5-hour window ${pct(five)}, resets ${when(five)}` + (week?.utilization != null ? ` · 7-day window ${pct(week)}, resets ${when(week)}` : '') + ` · as of ${new Date(d.usage.at).toLocaleTimeString()}`;
+  }
 }
 $('run-org').onclick = async () => {
-  if (orgAction === 'pause' && !confirm('Pause the factory? No new work starts. Agents already running finish their current stage.')) return;
+  if (orgAction === 'pause' && !(await confirmBox({ title: 'Pause the factory?', body: 'No new work starts while it is paused. Agents already running finish their current stage. You can resume at any time.', ok: 'Pause', danger: true }))) return;
   orgBusy = true; $('run-org').disabled = true;
   $('run-org').textContent = { start: 'Starting…', resume: 'Resuming…', pause: 'Pausing…' }[orgAction];
   try { await postJSON('/api/dispatcher', { action: orgAction }); }
-  catch (e) { alert(`Couldn't ${orgAction} the org: ${e.message}`); }
+  catch (e) { noticeBox(`Couldn't ${orgAction} the org`, e.message); }
   finally { $('run-org').disabled = false; orgBusy = false; setTimeout(loadDispatcher, 1500); }
 };
 setInterval(loadDispatcher, 10000); loadDispatcher();

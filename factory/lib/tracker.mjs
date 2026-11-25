@@ -151,3 +151,19 @@ export async function prMergeable(repo, pr) {
 export const mergePr = (repo, pr) => gh(['pr', 'merge', String(pr), '-R', repo, '--squash', '--delete-branch']);
 export const runWorkflow = (repo, wf, ref, inputs = {}) =>
   gh(['workflow', 'run', wf, '-R', repo, '--ref', ref, ...Object.entries(inputs).flatMap(([k, v]) => ['-f', `${k}=${v}`])]);
+
+/** Wait for the workflow_dispatch run started at or after `since` to finish. `gh workflow run` only queues it, so its exit
+ *  code says nothing about the deploy (feedback 2fa9b900). Resolves { ok, conclusion, url }; a run that never appears or
+ *  outlasts the timeout is not ok. */
+export async function waitWorkflow(repo, wf, since, { timeoutMs = 30 * 60e3, pollMs = 15e3 } = {}) {
+  const until = Date.now() + timeoutMs;
+  let run = null;
+  while (Date.now() < until) {
+    const runs = await json(['run', 'list', '-R', repo, '--workflow', wf, '--event', 'workflow_dispatch', '--limit', '10',
+      '--json', 'databaseId,createdAt,status,conclusion,url']).catch(() => []);
+    run = (runs ?? []).filter((r) => new Date(r.createdAt) >= new Date(since.getTime() - 5e3)).sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0] ?? run;
+    if (run?.status === 'completed') return { ok: run.conclusion === 'success', conclusion: run.conclusion, url: run.url };
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+  return { ok: false, conclusion: run ? `still ${run.status} after ${Math.round(timeoutMs / 60e3)} min` : 'no run appeared', url: run?.url };
+}

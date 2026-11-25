@@ -10,3 +10,6 @@ node_modules/
 /.factory/
 /workspaces/
 /archive/
+
+# Test-runner output
+test-results/
