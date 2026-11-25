@@ -5,6 +5,12 @@
 
 const MIN_NOTE = 20; // "n/a" is not a reason; the note is what the verify stage and auditors read
 
+/** The program a deploy_command runs: its first word, skipping VAR=value assignments and a `bash`/`sh` wrapper. */
+export function deployProgram(cmd) {
+  const words = String(cmd).trim().split(/\s+/).filter((w) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w));
+  return /^(ba)?sh$/.test(words[0] ?? '') && words[1] && !words[1].startsWith('-') ? words[1] : words[0] ?? '';
+}
+
 /**
  * Decide what a release verdict does to one environment.
  * @param verdict  the release verdict (deploy_now, no_runtime_surface, no_runtime_note, next_stage)
@@ -15,7 +21,7 @@ const MIN_NOTE = 20; // "n/a" is not a reason; the note is what the verify stage
  * @returns { status: 'deployed'|'no_runtime'|'hold'|'none', next, reason?, events: [[type, data]], deployedRepos, log }
  *   The caller records the events, and writes state.deployed only for 'deployed'.
  */
-export async function decideDeploy({ verdict: v, repos, env, runDeploy, probe }) {
+export async function decideDeploy({ verdict: v, repos, env, runDeploy, probe, resolves = () => true }) {
   const next = v.next_stage;
   const hold = (reason, detail, extra = {}) => ({ status: 'hold', next: 'release', reason, detail, events: [['deploy_skipped', { env, reason, detail: detail.slice(0, 1500), held: true, ...extra }]], deployedRepos: [], log: extra.log ?? '' });
   if (v.no_runtime_surface) { // nothing to run, so nothing to deploy or probe; the claim and its note are on the record
@@ -31,6 +37,8 @@ export async function decideDeploy({ verdict: v, repos, env, runDeploy, probe })
   const gaps = repos.flatMap((r) => [
     ...(r.deploy_command || r.deploy_workflow ? [] : [`${r.name}: no deploy_command or deploy_workflow in org.yaml product.repos[]`]),
     ...(r.health?.[env] ? [] : [`${r.name}: no health URL for ${env} (product.repos[].health.${env})`]),
+    // The command's program must exist where the deploy will look for it (owner request #133), checked before anything runs.
+    ...(r.deploy_command && !resolves(deployProgram(r.deploy_command), r) ? [`${r.name}: deploy_command executable ${deployProgram(r.deploy_command)} not found in the factory's deploy/ or PATH`] : []),
   ]);
   if (gaps.length) return hold('missing_config', `Deploy config is missing, so nothing was deployed to ${env}:\n${gaps.map((g) => `- ${g}`).join('\n')}`, { gaps });
   const events = [], logs = [];

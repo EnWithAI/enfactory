@@ -318,6 +318,17 @@ const commands = {
     if (!r.ok) process.exitCode = 1;
   },
 
+  // sf contains <sha> → is that commit in the running factory? (feedback 874e9459: read roles can't run git -C, which can write)
+  async contains() {
+    const sha = rest[0] ?? '';
+    if (!/^[0-9a-f]{7,40}$/i.test(sha)) throw new Error('usage: sf contains <commit sha>');
+    const head = execFileSync('git', ['-C', HOME, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    let yes = false;
+    try { execFileSync('git', ['-C', HOME, 'merge-base', '--is-ancestor', sha, 'HEAD'], { stdio: 'ignore' }); yes = true; } catch {}
+    console.log(`${yes ? '✓' : '✗'} ${sha} is ${yes ? '' : 'not '}in the running factory (HEAD ${head.slice(0, 12)})`);
+    if (!yes) process.exitCode = 1;
+  },
+
   async recall() {
     // sf recall --path deploy/local-node.sh → which open issues claim that file (owner request #115)
     if (flag('path')) {

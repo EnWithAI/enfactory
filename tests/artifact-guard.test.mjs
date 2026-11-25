@@ -11,7 +11,8 @@ const spec = readFileSync(new URL('./fixtures/spec-issue-2-v3.md', import.meta.u
 
 test('the #68 case: a council decision replacing a spec is refused, and the kept spec still lints', () => {
   assert.match(artifactRegression(spec, '# Council decision #68\nRoute: tech-grooming.'), /acceptance criteria/);
-  assert.deepEqual(specLint(spec, loadConfig()).failures, [], 'the version that is kept passes spec_lint');
+  const predates134 = (f) => !/closed set \("exactly"|§4a has no "Repo invariant" row/.test(f); // the fixture predates owner request #134
+  assert.deepEqual(specLint(spec, loadConfig()).failures.filter(predates134), [], 'the version that is kept passes spec_lint');
 });
 
 test('a much shorter replacement of a substantial artifact is refused', () => {

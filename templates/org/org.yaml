@@ -121,12 +121,14 @@ _read:
     "Bash(gh search issues:*)",
     "Bash(ls:*)",
     "Bash(gh pr view:*)",
+    "Bash(gh pr list:*)",
     "Bash(gh pr diff:*)",
     "Bash(gh pr checks:*)",
     "Bash(gh run list:*)",
     "Bash(gh run view:*)",
     "Bash(sf recall:*)",
     "Bash(sf memory:*)",
+    "Bash(sf contains:*)",
     "Bash(git log:*)",
     "Bash(git diff:*)",
     "Bash(git show:*)",
@@ -172,6 +174,7 @@ roles:
           "Bash(gh pr diff:*)",
           "Bash(sf recall:*)",
           "Bash(sf memory:*)",
+          "Bash(sf contains:*)",
           "Bash(sf contrast:*)",
           WebSearch,
           WebFetch,
@@ -213,6 +216,7 @@ roles:
           "Bash(gh pr diff:*)",
           "Bash(sf recall:*)",
           "Bash(sf memory:*)",
+          "Bash(sf contains:*)",
           "Bash(sf contrast:*)",
           WebSearch,
           WebFetch,
@@ -280,6 +284,7 @@ roles:
       - Edit(/{FACTORY}/memory/specs/*/tech-grooming/**)
       - Write(/{FACTORY}/memory/product/**)
       - Edit(/{FACTORY}/memory/product/**)
+      - Bash(sf contains:*)
   engineer:
     {
       headcount: 2,
@@ -598,7 +603,12 @@ economy:
     - { task: engage-intake, model: claude-sonnet-5-5, budget_usd: 1 }
     - { task: engage-requirements, model: claude-sonnet-5-5, budget_usd: 1 }
     - { task: digest, model: claude-sonnet-5-5, budget_usd: 2 }
-    - { task: feedback-review, model: claude-sonnet-5-5, effort: medium, budget_usd: 1.5 }
+    - {
+        task: feedback-review,
+        model: claude-sonnet-5-5,
+        effort: medium,
+        budget_usd: 1.5
+      }
     - { task: cut-, model: claude-sonnet-5-5, effort: medium, budget_usd: 1 }
     - { task: observe, effort: low, budget_usd: 0.5 }
     - { task: analysis, budget_usd: 1 }

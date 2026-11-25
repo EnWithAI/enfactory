@@ -11,9 +11,9 @@ export const KINDS = ['grant_tools', 'scoped_write', 'lint_family', 'lesson', 'd
 export const SAFE_TOOLS = new Set(['Read', 'Grep', 'Glob', 'WebSearch', 'WebFetch',
   ...['git log:*', 'git diff:*', 'git show:*', 'git status:*', 'git branch -r', 'git branch -a', 'git rev-parse:*',
     'npm view:*', 'npm ls:*', 'gitleaks version', 'node --version', 'pip index versions:*',
-    'gh issue view:*', 'gh issue list:*', 'gh pr view:*', 'gh pr diff:*', 'gh pr checks:*', 'gh run list:*', 'gh run view:*',
+    'gh issue view:*', 'gh issue list:*', 'gh pr view:*', 'gh pr list:*', 'gh pr diff:*', 'gh pr checks:*', 'gh run list:*', 'gh run view:*',
     'gh repo view:*', 'gh api -X GET:*', 'gh label list:*', 'gh search issues:*',
-    'sf recall:*', 'sf memory:*', 'sf lint:*', 'sf contrast:*', 'ls:*'].map((c) => `Bash(${c})`)]);
+    'sf recall:*', 'sf memory:*', 'sf lint:*', 'sf contrast:*', 'sf contains:*', 'ls:*'].map((c) => `Bash(${c})`)]);
 
 // Writable places: this install's memory, except the records only the dispatcher may write; or a role's /tmp scratch folder.
 const MEMORY_PATH = /^memory\/(?!ledger\/|state\/|hr\/|decisions\/|runs\/)[A-Za-z0-9_.*-]+(\/[A-Za-z0-9_.*-]+)*$/;

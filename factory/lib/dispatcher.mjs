@@ -1,7 +1,8 @@
 import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, appendFileSync } from 'node:fs';
 import path from 'node:path';
-import { execFile, execFileSync } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
+import { createHash } from 'node:crypto';
 import { HOME, p, loadConfig, headcount, STAGE_ORDER, teamOf, holderOf, vendors, owners } from './config.mjs';
 import * as T from './tracker.mjs';
 import * as M from './memory.mjs';
@@ -10,7 +11,7 @@ import { council } from './council.mjs';
 import { report } from './report.mjs';
 import * as R from './repos.mjs';
 import { recordAnswer } from './discovery.mjs';
-import { decideDeploy, probeHealth } from './deploy-gate.mjs';
+import { decideDeploy, probeHealth, deployProgram } from './deploy-gate.mjs';
 
 const now = () => new Date();
 const sh = promisify(execFile);
@@ -101,6 +102,49 @@ export function factoryPaths(paths) {
     (x && !x.includes('..') && !/^(org|memory|library|workspaces|archive|\.factory|\.memory\.git|node_modules)(\/|$)/.test(x) ? ok : refused).push(x);
   }
   return { ok, refused };
+}
+const sha = (s) => createHash('sha1').update(String(s ?? '')).digest('hex').slice(0, 16);
+/** Is `to` progress from `from`: later in the pipeline, closed, or a declared forward target (verify → release)? */
+const isForward = (cfg, from, to) => {
+  const order = STAGE_ORDER(cfg);
+  return ['done', 'rejected'].includes(to) || (cfg.pipeline[from]?.forward ?? []).includes(to) || (order.includes(to) && order.indexOf(to) > order.indexOf(from));
+};
+/** Where an issue stood when the dispatcher moved it (feedback 0333ef04, #77): what a later dispatch of `from` is compared against. */
+export function moveStamp(state, from, to, artifact, at = new Date().toISOString()) {
+  return { from, to, at, heads: JSON.stringify(state.heads ?? {}), artifact: sha(artifact), handoff: sha(state.lastHandoff?.text), history: state.history?.length ?? 0 };
+}
+/**
+ * Would running `stage` now repeat a forward advance (feedback 0333ef04, #77)? Returns the move when the issue last left `stage`
+ * forward and nothing has changed since: same HEADs, artifact, handoff and history, and no loop, failed check or approval in
+ * `events` (this issue's ledger since the move). null when the run is real work.
+ */
+export function repeatsAdvance(cfg, state, stage, artifact, events = []) {
+  const m = state.moved;
+  if (!m || m.from !== stage || m.to === stage || !isForward(cfg, stage, m.to)) return null;
+  const changed = m.heads !== JSON.stringify(state.heads ?? {}) || m.artifact !== sha(artifact) || m.handoff !== sha(state.lastHandoff?.text) ||
+    m.history !== (state.history?.length ?? 0) ||
+    events.some((e) => e.ts > m.at && (e.loop === true || e.outcome === 'loop_back' || e.type === 'check_failed' || e.type === 'human_approved'));
+  return changed ? null : m;
+}
+/**
+ * Is this advance one the issue already made (owner request #141, #77 recorded review → security twice)? True when the last move
+ * was exactly `stage` → `next`, so the issue is already at `next`. A real repeat always has a move in between (a loop-back, a rebuild).
+ */
+export function duplicateTransition(state, stage, next, outcome) {
+  return outcome === 'advance' && stage !== next && state.moved?.from === stage && state.moved.to === next;
+}
+/**
+ * How the brief shows the last handoff to `stage` (feedback 0333ef04, #77). "What must change" is only for work sent back: a loop-back
+ * from a later stage, a failed check, CI, the artifact guard, an approver, a person. An agent's own handoff onward from this stage
+ * is never shown to it as a change request. null when there is nothing to show.
+ */
+export function handoffFor(h, stage, cfg) {
+  if (!h?.text) return null;
+  if (h.from === stage && cfg.roles?.[h.by]) return null; // the stage's own verdict onward (a person's word at their stage still counts)
+  if (/^consult:/.test(h.from)) return { kind: 'answer', title: `Answer from ${h.by}`, text: h.text };
+  if (h.from === 'vendor') return { kind: 'answer', title: 'Delivered by the vendor', text: h.text };
+  if (STAGE_ORDER(cfg).includes(h.from) && h.from !== stage && isForward(cfg, h.from, stage)) return { kind: 'handoff', title: `Handoff to you from ${h.by} (${h.from})`, text: h.text };
+  return { kind: 'loop', title: `What must change (from ${h.by}, ${h.from})`, text: h.text };
 }
 // Faults in the harness or the account, not the agent's work: retried, never escalated, never a COE.
 const INFRA = /agents file changed|ENOENT|EAGAIN|ECONNRESET|overloaded|rate.?limit|session limit|usage limit|spawn |^exit (137|143)$|SIGTERM|SIGKILL|connection reset|i\/o timeout|timed out|EAI_AGAIN|ETIMEDOUT|ENOTFOUND|api\.github\.com|HTTP 50[0-9]|502 Bad Gateway|503 Service|not logged in|please run \/login|invalid api key|oauth token|authentication_error|gh auth login/i; // incl. runs killed by a stop or restart, network/GitHub outages, and a logged-out Claude or gh
@@ -193,6 +237,7 @@ export class Dispatcher {
     if (!this.cfg.product?.tracker || (eng && eng.phase !== 'delivery')) { await this.syncMemory(); return; }
     const { cfg } = this;
     const budget = (await import('./budget.mjs')).status(cfg), budgetLeft = budget.left; // includes today's approved extra
+    const listedAt = Date.now(); // a run that ends after this moment has made this list's labels stale for its issue
     const issues = await T.listIssues(this.repo, cfg.product.intake_label);
     const waitingNow = {};
     if (Date.now() - (this.answersAt ?? 0) > 120e3) { // owner answers on GitHub → answers.md (every 2 minutes)
@@ -236,7 +281,7 @@ export class Dispatcher {
 
     for (const issue of issues) {
       const n = issue.number;
-      if (this.running.has(n)) continue;
+      if (this.running.has(n) || this.settledSince(n, listedAt)) continue;
       const labels = T.labelsOf(issue);
       if (labels.includes(T.L.working)) await T.editLabels(this.repo, n, { remove: [T.L.working] }); // stale lock after a crash
       if (labels.includes('sf-waiting-vendor')) { await this.guard(n, () => this.checkVendor(issue)); continue; }
@@ -255,6 +300,7 @@ export class Dispatcher {
       const st = cfg.pipeline[stage];
       if (!st) continue; // done/rejected or a hand-applied label
       const state = M.issueState(n);
+      if (this.repeatedAdvance(n, stage, state)) { await this.guard(n, () => this.restoreStage(issue, stage, state)); continue; }
       if (state.holdUntil && new Date(state.holdUntil) > now()) continue;
       if (state.waitFor?.length) { // parked on planned dependencies: free until each has merged or closed
         const still = state.waitFor.filter((m) => open.has(m) && !Object.keys(M.issueState(m).merged ?? {}).length);
@@ -296,7 +342,7 @@ export class Dispatcher {
           if (!state.gateFailed) { state.gateFailed = { at: now().toISOString(), reason: g.reason }; M.saveIssueState(n, state); M.record('gate_failed', { stage, reason: g.reason, gates }, { issue: n }); }
           if (!this.draining && budgetLeft > 0) {
             this.running.set(n, { role: 'product-owner', stage: 'cut', since: now().toISOString() });
-            this.gateCut(issue, stage, state, g.reason).catch((e) => console.error(`✗ #${n} gate: ${e.message}`)).finally(() => this.running.delete(n));
+            this.gateCut(issue, stage, state, g.reason).catch((e) => console.error(`✗ #${n} gate: ${e.message}`)).finally(() => this.settle(n)); // settle: a stale issue list can't re-dispatch it right after
           }
           continue;
         }
@@ -385,7 +431,7 @@ export class Dispatcher {
       })
       .finally(async () => {
         await T.editLabels(this.repo, n, { remove: [T.L.working] }).catch(() => {});
-        this.running.delete(n);
+        this.settle(n);
       });
   }
 
@@ -646,12 +692,17 @@ export class Dispatcher {
         if (f.blocking && cfg.delivery?.mode === 'release') await import('./release.mjs').then((R) => R.admit(cfg, m, { title: f.title, body: f.body, reason: `blocking prerequisite of #${n}: ${f.reason}` })).catch(() => {});
       }
     }
+    if (duplicateTransition(state, stage, next, v.outcome)) { // the issue is already at `next` (owner request #141): record nothing twice
+      M.record('duplicate_transition', { stage, to: next, outcome: v.outcome, moved_at: state.moved.at, summary: v.summary?.slice(0, 300), cost_usd: res.cost }, { actor: role, issue: n });
+      return T.setStage(repo, n, stage, next); // a label that still said `stage` is what let it run again
+    }
     if (isLoop) {
       state.loops += 1;
       this.coe({ issue: n, kind: 'loop_back', from: stage, to: next, by: role, reason: `${v.summary}\n\nHandoff: ${v.handoff}` });
     }
     state.history.push({ ts: now().toISOString(), stage, to: next, outcome: v.outcome, by: role });
-    state.lastHandoff = { from: stage, by: role, text: fromCouncil && res.thread ? `${v.handoff}\n\nThe council's discussion and decision: ${p(res.thread)}` : v.handoff };
+    // A council's route is a decision for whoever runs next, the same stage included; an agent's own handoff is not shown back to it.
+    state.lastHandoff = { from: fromCouncil ? `council:${stage}` : stage, by: role, text: fromCouncil && res.thread ?`${v.handoff}\n\nThe council's discussion and decision: ${p(res.thread)}` : v.handoff };
     if (v.risk_tier) state.risk = v.risk_tier;
     if (v.next_assignee && (cfg.pipeline[next]?.pool ?? []).includes(v.next_assignee)) state.assign = { ...state.assign, [next]: v.next_assignee };
     if (v.repos?.length) state.repos = v.repos;
@@ -718,7 +769,7 @@ export class Dispatcher {
       // Deployed means the deploy step exited 0 AND the health URL answered 200 (feedback 2fa9b900: a repo with no deploy
       // config used to fall out of the loop, so staging was marked deployed and the issue moved to verify with nothing running).
       const env = v.environment ?? this.nextEnv(state);
-      const d = await decideDeploy({ verdict: v, repos: this.deployable(state), env, runDeploy: (r, e) => this.deploy(r, e), probe: (u) => probeHealth(u) });
+      const d = await decideDeploy({ verdict: v, repos: this.deployable(state), env, runDeploy: (r, e) => this.deploy(r, e), probe: (u) => probeHealth(u), resolves: (prog, r) => this.resolvesProgram(prog, r) });
       for (const [type, data] of d.events) M.record(type, { ...data, risk: state.risk }, { actor: type === 'deploy' ? role : 'deploy', issue: n });
       if (d.status === 'deployed') {
         state.deployed = { ...state.deployed, [env]: now().toISOString() };
@@ -816,7 +867,29 @@ export class Dispatcher {
       M.record('closed', { to, loops: state.loops }, { issue: n });
       return;
     }
-    if (from !== to) await T.setStage(this.repo, n, from, to);
+    if (from !== to) {
+      await T.setStage(this.repo, n, from, to);
+      state.moved = moveStamp(state, from, to, this.artifactText(n, from)); // what a stale re-dispatch of `from` is checked against
+      M.saveIssueState(n, state);
+    }
+  }
+
+  /** Did a run of this issue end after the issue list was fetched? Then the list's stage label may be the old one (feedback 0333ef04). */
+  settledSince(n, listedAt) { return (this.settled?.get(n) ?? 0) >= listedAt; }
+  settle(n) { (this.settled ??= new Map()).set(n, Date.now()); this.running.delete(n); }
+  artifactText(n, stage) { try { return readFileSync(p('memory/specs', `issue-${n}`, `${stage}.md`), 'utf8'); } catch { return ''; } }
+
+  /** The label says `stage`, but the issue already advanced from it and nothing changed since (feedback 0333ef04, #77). */
+  repeatedAdvance(n, stage, state) {
+    if (state.moved?.from !== stage) return null; // the common case: no ledger read
+    return repeatsAdvance(this.cfg, state, stage, this.artifactText(n, stage), M.events({ since: state.moved.at }).filter((e) => e.issue === n));
+  }
+  /** Don't run the stage again: put the label back where the verdict sent it. */
+  async restoreStage(issue, stage, state) {
+    const m = state.moved;
+    M.record('redispatch_blocked', { stage, to: m.to, moved_at: m.at, reason: 'already advanced, nothing changed (same HEAD, artifact and handoff; no loop)' }, { issue: issue.number });
+    console.log(`⏭ #${issue.number} ${stage} already advanced to ${m.to} at ${m.at}; not re-running`);
+    await T.setStage(this.repo, issue.number, stage, m.to);
   }
 
   /** Loop-backs since the owner last approved: what council, chair and runaway thresholds count (the full history is kept). */
@@ -939,12 +1012,62 @@ export class Dispatcher {
       M.saveIssueState(n, state);
       const mergeSha = (await T.gh(['pr', 'view', String(pr), '-R', r.repo, '--json', 'mergeCommit', '--jq', '.mergeCommit.oid']).catch(() => '')) || null;
       M.record(r.factory ? 'factory_merged' : 'merged', { repo: r.name, pr, risk: state.risk, checks: checks[r.name], head_sha: state.heads?.[r.name] ?? null, merge_sha: mergeSha }, { issue: n });
+      if (r.factory) state.factoryMergeSha = mergeSha;
     }
-    const factoryNote = state.merged?.[this.factory?.name] ? `\n\nThe factory change is merged into ${this.factory.repo}. The running factory picks it up only when the owner pulls the code and restarts the dispatcher.` : '';
+    // The owner approved a factory change: bring the running factory up to it (owner request #132), or say why not.
+    let factoryNote = '';
+    if (state.merged?.[this.factory?.name] && !state.factorySynced) {
+      const s = await this.syncFactory(state.factoryMergeSha);
+      M.record('factory_synced', { merge_sha: state.factoryMergeSha ?? null, local_head: s.head, ok: s.ok, reason: s.reason ?? null }, { issue: n });
+      if (!s.ok) {
+        M.saveIssueState(n, state);
+        return this.escalate(n, state, 'merge', `**Factory merged but not active.** ${this.factory.repo} has the change, but the running factory couldn't fast-forward to it: ${s.reason}. ` +
+          `Bring the factory checkout up to date by hand (\`git -C <factory> pull --ff-only\`), restart the dispatcher, then approve to finish.`, owners(cfg));
+      }
+      state.factorySynced = true; M.saveIssueState(n, state);
+      factoryNote = `\n\nThe factory change is merged into ${this.factory.repo}, and the running factory is now at ${s.head.slice(0, 7)}. The dispatcher restarts itself once running agents finish, so the change takes effect.`;
+      this.restartSoon('factory updated to ' + s.head.slice(0, 7));
+    }
     await T.comment(repo, n, `### ✅ Merged ${this.prList(state)} (risk: ${state.risk ?? 'n/a'})${factoryNote}`);
     await R.dropWorktrees(n, this.touched(state));
     // Only product repos are released; a factory-only change is finished once merged.
     await this.move(issue, 'merge', this.deployable(state).length ? 'release' : 'done', state);
+  }
+
+  /** The running factory's commit, for briefs (feedback 874e9459). Read-only; cached briefly. */
+  factoryHead() {
+    if (this.headCache && Date.now() - this.headCache.at < 60e3) return this.headCache.sha;
+    let sha = 'unknown';
+    try { sha = execFileSync('git', ['-C', HOME, 'rev-parse', '--short=12', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch {}
+    this.headCache = { sha, at: Date.now() };
+    return sha;
+  }
+
+  /**
+   * Fast-forward the running factory's checkout to a merged factory change. Fails closed: local changes, a diverged
+   * history or a merge that isn't a fast-forward leave it untouched. Returns { ok, head, reason }.
+   */
+  async syncFactory(sha, dir = HOME) {
+    const g = (args) => R.git(args, dir);
+    try {
+      const dirty = await g(['status', '--porcelain', '--untracked-files=no']);
+      if (dirty) return { ok: false, head: await g(['rev-parse', 'HEAD']), reason: `the factory checkout has local changes:\n${dirty.split('\n').slice(0, 10).join('\n')}` };
+      await g(['fetch', '-q', 'origin']);
+      await g(['merge', '--ff-only', '-q', sha || `origin/${this.factory.default_branch}`]);
+      const head = await g(['rev-parse', 'HEAD']);
+      if (sha && !(await g(['merge-base', '--is-ancestor', sha, 'HEAD']).then(() => true, () => false))) return { ok: false, head, reason: `HEAD ${head.slice(0, 7)} doesn't contain ${sha.slice(0, 7)}` };
+      return { ok: true, head };
+    } catch (e) { return { ok: false, head: await g(['rev-parse', 'HEAD']).catch(() => ''), reason: e.message.split('\n')[0] }; }
+  }
+
+  /** Restart this dispatcher once running agents finish, so updated factory code loads. A detached waiter starts the new one. */
+  restartSoon(why) {
+    if (this.restarting || process.argv[2] !== 'run') return; // only the long-running dispatcher restarts itself
+    this.restarting = true;
+    console.log(`restart: ${why}; restarting once running agents finish`);
+    spawn('/bin/sh', ['-c', 'while kill -0 "$1" 2>/dev/null; do sleep 2; done; exec "$2" run', 'sh', String(process.pid), p('bin/sf')],
+      { cwd: HOME, detached: true, stdio: 'ignore' }).unref();
+    process.kill(process.pid, 'SIGTERM'); // the graceful drain in sf run: start nothing new, let running agents finish, then exit
   }
 
   profile(env) { const ro = this.cfg.aws?.readonly_profile ?? ''; return typeof ro === 'string' ? ro : ro[env] ?? ''; }
@@ -1148,6 +1271,17 @@ export class Dispatcher {
     M.saveIssueState(n, state);
   }
 
+  /**
+   * Does a deploy program exist where deploy() will look (owner request #133)? A path is checked in the repo's checkout;
+   * a bare name in the factory's deploy/ folder, then on PATH. The name is passed as an argument, never into the shell text.
+   */
+  resolvesProgram(prog, r) {
+    if (!prog) return false;
+    if (prog.includes('/')) return existsSync(path.isAbsolute(prog) ? prog : path.join(R.baseDir(r), prog));
+    if (existsSync(p('deploy', prog))) return true;
+    try { execFileSync('/bin/sh', ['-c', 'command -v "$1" >/dev/null', 'sh', prog], { stdio: 'ignore', env: { ...process.env, PATH: `${p('deploy')}:${process.env.PATH}` } }); return true; } catch { return false; }
+  }
+
   repoByName(name) { return this.repos.find((r) => r.name === name) ?? (this.factory?.name === name ? this.factory : undefined); }
   prList(state) { return Object.entries(state.prs ?? {}).map(([name, pr]) => `${this.repoByName(name).repo}#${pr}`).join(', '); }
   // An environment passed with no_runtime_surface counts as done for promotion, without ever being marked deployed.
@@ -1238,10 +1372,11 @@ export class Dispatcher {
     const st = this.cfg.pipeline[stage];
     const people = (issue.comments ?? []).filter((c) => !c.body.includes(T.MARK) && c.createdAt > since)
       .map((c) => `- **${c.author?.login ?? 'person'}**: ${c.body.trim().slice(0, 1500)}`);
+    const h = handoffFor(state.lastHandoff, stage, this.cfg);
     return [
       `# Back to you: #${issue.number} \`${stage}\``,
       `The work came back to you, so this continues your earlier session. Everything you read then still applies; don't re-read it.`,
-      state.lastHandoff ? `\n## What must change (from ${state.lastHandoff.by}, ${state.lastHandoff.from})\n${state.lastHandoff.text}` : '',
+      h ? `\n## ${h.title}\n${h.text}` : '',
       people.length ? `\n## New comments from people (authoritative)\n${people.join('\n')}` : '',
       `\nFactory state now: loops=${state.loops} risk=${state.risk ?? 'unset'} prs=${this.prList(state) || 'none'}`,
       `\nRevise your ${stage} work for exactly these changes, then hand in a complete verdict with the full artifact. Choose next_stage from: ${st.next.map((s) => `\`${s}\``).join(', ')}.`,
@@ -1300,10 +1435,11 @@ export class Dispatcher {
       `## Issue body`, issue.body || '_(empty)_', '',
       `## Factory state`,
       `priority=${T.priorityOf(issue)} risk=${state.risk ?? 'unset'} loops=${state.loops} repos=${this.touched(state).map((r) => r.name).join(',')} prs=${this.prList(state) || 'none'} deployed=${JSON.stringify(state.deployed ?? {})}`,
+      `factory: running at ${this.factoryHead()} (check a merged factory change with \`sf contains <sha>\`)`,
       this.spend ? `spend: today $${this.spend.today_usd} of $${this.spend.daily_budget_usd} daily budget${this.spend.release ? ` · Release ${this.spend.release} so far $${this.spend.release_usd}` : ''} (as of ${this.spend.at.slice(11, 16)} UTC; also in ${p('memory/state/spend.json')})` : '',
       ...(() => { const A = this.answersLatest ?? []; return A.length ? [`\n## Owner answers (newest first; these override answers.md and any earlier assumption)`,
         ...A.map((a) => `- **#${a.request}** (${a.ts.slice(0, 16).replace('T', ' ')} UTC): ${a.text.replace(/\s+/g, ' ').slice(0, 300)}`)] : []; })(),
-      state.lastHandoff ? `\n## Handoff to you from ${state.lastHandoff.by} (${state.lastHandoff.from})\n${state.lastHandoff.text}` : '',
+      (({ title, text } = handoffFor(state.lastHandoff, stage, cfg) ?? {}) => title ? `\n## ${title}\n${text}` : '')(),
       people.length ? `\n## What people said on the issue (authoritative)\n${people.join('\n')}` : '',
       issue.ci ? `\n## CI on the PR right now (${issue.ci.status === 'timeout' ? 'some checks still running' : issue.ci.status})\n${issue.ci.table}\n` +
         `You can't advance while any check is red: the dispatcher sends red CI back to build automatically.` +
@@ -1316,6 +1452,12 @@ export class Dispatcher {
         return c.length ? `\n## ⚠️ Other open issues edit the same files\n${c.map((x) => `- #${x.issue}: ${x.path} (yours: ${x.mine})`).join('\n')}\nCoordinate: build on theirs (delta_of), wait for it, or mark a duplicate. Don't overwrite their work.` : '';
       })(),
       digest ? `\n## How your team works (digest of the operating model and the ${team} charter)\n${digest}` : '',
+      // Each touched repo's invariants and conventions, verbatim, where specs and designs are written (owner request #135).
+      ['analysis', 'feature-grooming', 'tech-grooming'].includes(stage) ? this.deployable(state).map((r) => {
+        const doc = read(`memory/product/repos/${r.name}.md`);
+        const parts = doc.split(/^(?=#{2,3}\s)/m).filter((s) => /^#{2,3}\s.*(invariant|convention)/i.test(s));
+        return parts.length ? `\n## Repo invariants (authoritative): ${r.name}\nFrom ${p('memory/product/repos', `${r.name}.md`)}. A spec or design that breaks one of these is wrong unless an ADR changes it.\n${clip(parts.join('\n').trim(), 8, `memory/product/repos/${r.name}.md`)}` : '';
+      }).join('') : '',
       brief ? `\n## The product (brief)\n${brief}` : '',
       answers ? `\n## Owner answers (current)\n${clip(answers, 8, 'memory/product/answers.current.md')}` : '',
       inline.length ? `\n## Earlier work on this issue\n${inline.join('\n')}` : '',
@@ -1326,7 +1468,7 @@ export class Dispatcher {
       `- \`sf recall "<keywords>"\` for decisions and learnings from other issues.`,
       st.workspace ? `\n## Workspace (cwd: ${cwd})\nOne sub-folder per repo, each a git worktree on branch \`sf/issue-${n}\`:\n${this.touched(state).map((r) => `- \`${r.name}/\`: ${r.repo} (base \`origin/${r.default_branch}\`)`).join('\n')}\nOnly change repos the tech design names. If another repo must change, loop back to tech-grooming.` : '',
       stage === 'release' ? `\n## Go-live policy\n${cfg.release.policy}\nEnvironments in order: ${this.envs.join(' → ')}. Already deployed: ${JSON.stringify(state.deployed ?? {})}. The next one is **${this.nextEnv(state)}**.${Object.keys(state.noRuntime ?? {}).length ? ` Passed with no runtime surface: ${JSON.stringify(state.noRuntime)}.` : ''}\n` +
-        `Deploy config for ${this.nextEnv(state)}:\n${this.deployable(state).map((r) => `- ${r.name}: deploy ${r.deploy_command ? `\`${r.deploy_command}\`` : r.deploy_workflow || '(none configured)'}, health ${r.health?.[this.nextEnv(state)] || '(none configured)'}`).join('\n')}\n` +
+        `Deploy config for ${this.nextEnv(state)}:\n${this.deployable(state).map((r) => `- ${r.name}: deploy ${r.deploy_command ? `\`${r.deploy_command}\` (resolves: ${this.resolvesProgram(deployProgram(r.deploy_command), r) ? 'yes' : 'no'})` : r.deploy_workflow || '(none configured)'}, health ${r.health?.[this.nextEnv(state)] || '(none configured)'}`).join('\n')}\n` +
         `The dispatcher marks the environment deployed only if every repo's deploy exits 0 and its health URL answers 200; otherwise the release is held whatever you choose. ` +
         `If the change has nothing to run (no build, no server, no bundle change), set \`no_runtime_surface: true\` with a \`no_runtime_note\` saying why, and no deploy or probe runs.\nRecent deploys:\n${this.deployable(state).filter((r) => r.deploy_workflow).map((r) => `- \`gh run list -R ${r.repo} --workflow ${r.deploy_workflow} --limit 10\``).join('\n')}` : '',
       stage === 'verify' ? `\n## Validate ${state.lastEnv ?? 'the deploy'} (${state.deployed?.[state.lastEnv] ? `deployed ${state.deployed[state.lastEnv]}` : state.noRuntime?.[state.lastEnv] ? `not deployed: the release manager declared no runtime surface at ${state.noRuntime[state.lastEnv]}; confirm nothing needed to run` : 'deployed ?'})\n${this.profile(state.lastEnv) ? `You have read-only AWS access (profile \`${this.profile(state.lastEnv)}\`, region ${cfg.aws?.region}). Start with \`aws sts get-caller-identity --profile ${this.profile(state.lastEnv)}\`.` : 'This environment runs on the local machine. Use the health URLs and the deploy log.'}\n` +

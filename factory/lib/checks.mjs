@@ -113,6 +113,20 @@ export function specLint(md, cfg) {
   }
   // (7) a negative control states an exact count
   for (const a of list) if (/negative control/i.test(a.line) && /(≥|>=|at least)\s*\d+\s*(?:\w+\s+){0,2}hits?\b/i.test(a.line.split(/\*{0,2}then\*{0,2}/i).slice(1).join(' ') || a.line)) failures.push(`${a.id}: a negative control must state an exact count, not "≥" or "at least".`);
+  // (8, 9) Grounded in the repo docs (owner request #134, COE on #53). Only for repos that have an engineering doc.
+  const docs = (cfg.product?.repos ?? []).filter((r) => existsSync(p('memory/product/repos', `${r.name}.md`)) && new RegExp(`\\b${r.name}\\b`, 'i').test(md));
+  if (docs.length) {
+    const sectionBy = (re) => { const i = lines.findIndex((l) => /^#{2,4}\s/.test(l) && re.test(l)); if (i < 0) return null; const j = lines.findIndex((l, k) => k > i && /^#{2,4}\s/.test(l)); return lines.slice(i + 1, j < 0 ? lines.length : j).join('\n'); };
+    // (8) A closed-set AC ("exactly", "only", an allowed list of roots) says where the set comes from: the repo doc or origin/main.
+    const closed = list.filter((a) => /\b(exactly|only)\b|allowed[- ]roots?/i.test(a.text));
+    const provenance = sectionBy(/provenance/i);
+    if (closed.length && !(provenance && /memory\/product\/repos\/|origin\/main:/.test(provenance)))
+      failures.push(`${closed.map((a) => a.id).join(', ')} state a closed set ("exactly", "only" or allowed roots). Add a "Path provenance" section that cites memory/product/repos/<repo>.md or origin/main:<path> for it.`);
+    // (9) §4a traces the repo's invariants, or says none apply.
+    const trace4a = sectionBy(/^#{2,4}\s*§?4a\b/i) ?? '';
+    if (!/repo invariant/i.test(trace4a))
+      failures.push(`§4a has no "Repo invariant" row. Trace each invariant in ${docs.map((r) => `memory/product/repos/${r.name}.md`).join(', ')} that this spec touches, or add "Repo invariants: none apply (checked §n)".`);
+  }
   // (4) more than max ACs needs a stated exception in §9
   if (list.length > max && !/exception|more than \d+|exceeds? \d+|>\s*\d+\s*ACs?/i.test(sec['9'] ?? '')) failures.push(`${list.length} ACs exceeds ${max}. Split the slice, or add a one-line exception with the reason in §9.`);
   return { ok: !failures.length, acs: list.length, failures };

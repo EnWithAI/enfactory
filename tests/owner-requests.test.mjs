@@ -56,3 +56,4 @@ test('#122: the build is skipped only when every done_when check already holds',
   assert.equal(freshness([{ file: 'missing.txt', contains: 'x', count: 1 }], read).results[0].found, 0, 'a missing file has no matches');
   assert.equal(freshness([], read).allHold, false, 'no checks never skips a build');
 });
+

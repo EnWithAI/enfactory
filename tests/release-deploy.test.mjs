@@ -105,3 +105,17 @@ test('probeHealth: 200 is healthy, 503 and an unreachable port are not, and each
   const dead = await probeHealth(base, { attempts: 1 });
   assert.equal(dead.status, 0);
 });
+
+// Owner request #133: a deploy_command whose program doesn't resolve holds the release before anything runs.
+test('#133: an unresolvable deploy program holds with missing_config and runs nothing', async () => {
+  const { decideDeploy, deployProgram } = await import('../factory/lib/deploy-gate.mjs');
+  assert.equal(deployProgram('local-node.sh {name} {env} {port}'), 'local-node.sh');
+  assert.equal(deployProgram('NODE_ENV=production bash deploy/local-node.sh enwallet staging'), 'deploy/local-node.sh', 'skips env vars and a bash wrapper');
+  let ran = false;
+  const d = await decideDeploy({ verdict: { deploy_now: true, next_stage: 'verify' }, env: 'staging',
+    repos: [{ name: 'enwallet', deploy_command: 'nope.sh {name} {env}', health: { staging: 'http://127.0.0.1:4310/' } }],
+    runDeploy: async () => { ran = true; return { ok: true }; }, probe: async () => ({ status: 200 }), resolves: (prog) => prog !== 'nope.sh' });
+  assert.equal(d.status, 'hold'); assert.equal(d.reason, 'missing_config');
+  assert.match(d.detail, /executable nope\.sh not found/);
+  assert.equal(ran, false, 'no deploy is attempted');
+});
