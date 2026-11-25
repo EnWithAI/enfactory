@@ -155,6 +155,20 @@ export async function startRelease(cfg, number) {
   return true;
 }
 
+/** During delivery the product owner answers the client: status, questions and change requests, against the live release. */
+async function delivery(cfg, s) {
+  const R = await import('./release.mjs');
+  const r = await runAgent({ cfg, role: 'product-owner', label: 'engage-delivery',
+    schema: { type: 'object', properties: { reply_markdown: { type: 'string', description: 'What you say to the client now. Plain words, honest about status and risk.' }, decisions: { type: 'array', items: DECISION } }, required: ['reply_markdown'] },
+    prompt: `# Client engagement · delivery\nYou are talking with the client directly, in the Client room, while we build the planned releases. Answer their latest message. ` +
+      `For status, check the live state (\`gh issue list -R ${cfg.product.tracker} --milestone "<release>"\`, \`sf memory issue <n>\`) and say plainly what is done, ` +
+      `in progress and at risk against the target date. A scope change is not agreed here: say what it would cost and that it goes into the release plan.\n\n` +
+      `## Current release\n${JSON.stringify(R.current() ?? 'none', null, 2).slice(0, 4000)}\n\n## Conversation so far\n${transcript()}` });
+  if (!r.ok) return say('system', `The product-owner couldn't respond (${String(r.error).slice(0, 160)}). Send your message again.`);
+  for (const d of r.out.decisions ?? []) M.decide(d, { actor: 'product-owner', scope: 'engagement/delivery' });
+  say('product-owner', r.out.reply_markdown);
+}
+
 /** Move to the next phase and do what it needs. */
 async function advance(cfg) {
   const s = state();
@@ -187,6 +201,7 @@ async function respond(cfg = loadConfig()) {
   if (CONVO[s.phase]) return turn(cfg, s);
   if (s.phase === 'proposal') return proposal(cfg, s); // revise with the client's comments in the thread
   if (s.phase === 'planning') return planning(cfg, s, last);
+  if (s.phase === 'delivery') return delivery(cfg, s);
   if (s.phase === 'setup') { // the client is answering the repo question
     const m = last.match(/([\w.-]+\/[\w.-]+)/); if (m) { s.repo = m[1]; save(s); }
     return setup(cfg, state());

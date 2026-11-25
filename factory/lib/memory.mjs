@@ -62,6 +62,18 @@ export function snapshotArtifact(issue, stage) {
   if (v && readFileSync(p('memory/specs', `issue-${issue}`, `${stage}.v${v}.md`), 'utf8') === cur) return;
   writeFileSync(p('memory/specs', `issue-${issue}`, `${stage}.v${v + 1}.md`), cur);
 }
+/**
+ * Would replacing a stage artifact lose work? (feedback 118f8faf, #68) Returns the reason, or null when the new text may replace it:
+ * it drops the acceptance criteria the previous version had, or it is a fraction of a substantial previous version.
+ */
+export function artifactRegression(prev, next) {
+  if (!prev?.trim()) return null;
+  const ac = /^#{1,3}\s.*(acceptance criteria|ac registry)/im;
+  if (ac.test(prev) && !ac.test(next ?? '')) return 'it drops the acceptance criteria section the previous version had';
+  if (prev.length > 2000 && (next ?? '').length < prev.length / 4) return `it is ${(next ?? '').length} characters against ${prev.length} in the previous version`;
+  return null;
+}
+
 /** Save a stage's artifact. The previous text is kept as a version first (agents may also write the file during their run). */
 export function saveArtifact(issue, stage, markdown) {
   const file = p('memory/specs', `issue-${issue}`, `${stage}.md`);

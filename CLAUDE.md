@@ -79,7 +79,8 @@ When acting:
 - Evidence over assertion. Claims of "tested", "secure", or "meets AC" cite commands run and their output.
 - Use the latest stable dependencies only. Ship with 0 critical, 0 high, and 0 medium vulnerabilities
   (`npm audit --audit-level=moderate`, `pip-audit`, image scan). Explicit security pins override "latest".
-  Flag any conflict.
+  Flag any conflict. On PRs, patch drift from latest that is under 72 hours old is a warning, not a failure: a daily bump on the
+  default branch keeps it on latest. Minor or major drift, drift older than 72 hours, and any vulnerability still fail.
 - Never push to the default branch, force-push shared branches, touch secrets, or deploy outside the go-live policy.
 ## Decision rights: agents decide, people provide
 - **Decide everything your role owns.** Don't ask a person for a decision. If a decision belongs to another role, say so in

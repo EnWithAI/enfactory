@@ -118,15 +118,51 @@ export function specLint(md, cfg) {
   return { ok: !failures.length, acs: list.length, failures };
 }
 
-export const CHECKS = { spec_lint: specLint };
+/**
+ * ac_evidence (owner request #69, COE on #3): a build may advance only when its "## AC → evidence" table proves every AC.
+ * Each row's Status (or Result) cell must start with pass or post-deploy (verified after deploy by design). A revision restates
+ * the whole table; "unchanged from the previous build" doesn't count. With the issue's spec on hand, every spec AC needs a row.
+ */
+export function acEvidence(md, cfg, { issue = null } = {}) {
+  const lines = md.split('\n'), failures = [];
+  const start = lines.findIndex((l) => /^#{2,3}\s+AC\s*(→|->|to)\s*(evidence|tests?)\b/i.test(l));
+  if (start < 0) return { ok: false, failures: ['No "## AC → evidence" table. Add one row per AC: | AC | Test | Status |, with Status pass or post-deploy.'] };
+  const level = lines[start].match(/^#+/)[0].length;
+  let end = lines.findIndex((l, i) => i > start && new RegExp(`^#{1,${level}}\\s`).test(l));
+  if (end < 0) end = lines.length;
+  const body = lines.slice(start + 1, end), table = body.filter((l) => /^\s*\|/.test(l));
+  if (/unchanged from the previous|same as (the )?previous|as in the previous build|as before/i.test(body.join(' ')))
+    failures.push('The AC table refers to a previous build instead of restating it. Restate every row with its current test and status.');
+  if (table.length < 3) return { ok: false, failures: [...failures, 'The AC → evidence section has no table rows. One row per AC: | AC | Test | Status |.'] };
+  const cells = (l) => l.trim().replace(/^\||\|$/g, '').split('|').map((c) => c.trim());
+  const head = cells(table[0]).map((h) => h.toLowerCase()), col = head.findIndex((h) => /^(status|result)$/.test(h));
+  if (col < 0) return { ok: false, failures: [...failures, 'The AC table needs a Status column (pass or post-deploy per AC), so its state is explicit.'] };
+  const rows = table.slice(1).filter((l) => !/^\s*\|[\s:|-]+\|\s*$/.test(l)).map(cells);
+  const norm = (id) => String(id).replace(/[*`]/g, '').replace(/^AC-/i, '').trim().toUpperCase();
+  // pass, or explicitly verified after deploy by design; never a known gap dressed up ("partial", "fail", "missing"…).
+  const GAP = /\b(partial|fail(s|ed|ing)?|missing|not (added|run|done|tested)|todo|to do|skipped?|tbd|wip|blocked)\b/i;
+  const proven = (cell) => { const s = cell.replace(/[*_`]/g, '').trim(); return /^(pass(ed|es)?|done|met|✅)\b/i.test(s) || (/\bpost-deploy\b/i.test(s) && !GAP.test(s)); };
+  const bad = rows.filter((r) => !proven(r[col] ?? ''));
+  for (const r of bad) failures.push(`AC-${norm(r[0])} is "${(r[col] || 'blank').slice(0, 80)}", not pass. Finish it; if it can only be proven after deploy, write "post-deploy (SRE)"; if it can't be met as designed, loop back to tech-grooming.`);
+  // Every AC in the spec has a row: a known gap can't disappear by leaving its row out.
+  const spec = issue ? p('memory/specs', `issue-${issue}`, 'feature-grooming.md') : null;
+  if (spec && existsSync(spec)) {
+    const have = new Set(rows.map((r) => norm(r[0])));
+    const missing = acs(readFileSync(spec, 'utf8')).map((a) => norm(a.id)).filter((id) => !have.has(id));
+    if (missing.length) failures.push(`No row for ${missing.map((m) => `AC-${m}`).join(', ')}. Every AC in the spec needs a row in the table.`);
+  }
+  return { ok: !failures.length, failures };
+}
 
-/** Run a stage's declared checks against its artifact. */
-export function runChecks(names, md, cfg) {
+export const CHECKS = { spec_lint: specLint, ac_evidence: acEvidence };
+
+/** Run a stage's declared checks against its artifact. `ctx.issue` lets a check read the issue's other artifacts. */
+export function runChecks(names, md, cfg, ctx = {}) {
   const failures = [];
   for (const name of names ?? []) {
     const fn = CHECKS[name];
     if (!fn) { failures.push(`unknown check "${name}"`); continue; }
-    const r = fn(md, cfg);
+    const r = fn(md, cfg, ctx);
     if (!r.ok) failures.push(...r.failures.map((f) => `[${name}] ${f}`));
   }
   return { ok: !failures.length, failures };
@@ -136,5 +172,5 @@ export function runChecks(names, md, cfg) {
 export function lintIssue(n, stage, cfg) {
   const f = p('memory/specs', `issue-${n}`, `${stage}.md`);
   if (!existsSync(f)) throw new Error(`no ${stage} artifact for #${n}`);
-  return runChecks(cfg.pipeline[stage]?.checks ?? ['spec_lint'], readFileSync(f, 'utf8'), cfg);
+  return runChecks(cfg.pipeline[stage]?.checks ?? (stage === 'build' ? ['ac_evidence'] : ['spec_lint']), readFileSync(f, 'utf8'), cfg, { issue: n });
 }

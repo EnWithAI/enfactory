@@ -364,6 +364,7 @@ pipeline:
       sub-folder per repo, same branch name). Commit in each. All tests must
       pass locally.
     next: [ review, tech-grooming, feature-grooming ]
+    checks: [ ac_evidence ] # every AC proven (pass or post-deploy) before review; owner request #69
   review:
     role: reviewer
     workspace: true

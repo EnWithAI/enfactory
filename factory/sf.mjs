@@ -302,14 +302,17 @@ const commands = {
   },
 
   async lint() {
-    // sf lint spec <issue>  → runs the checks declared on feature-grooming against that issue's spec
+    // sf lint spec <issue>   → the checks declared on feature-grooming, against that issue's spec
+    // sf lint build <issue>  → the checks declared on build (the AC → evidence table), against its build.md
     const [kind, n] = rest;
-    if (kind !== 'spec' || !n) throw new Error('usage: sf lint spec <issue>');
+    const stage = { spec: 'feature-grooming', build: 'build' }[kind];
+    if (!stage || !n) throw new Error('usage: sf lint spec|build <issue> [--stdin]');
     const C = await import('./lib/checks.mjs'), cfg = loadConfig();
+    const checks = cfg.pipeline[stage]?.checks ?? (stage === 'build' ? ['ac_evidence'] : ['spec_lint']);
     const r = has('stdin') // lint a draft before handing it in: sf lint spec <n> --stdin < draft.md
-      ? C.runChecks(cfg.pipeline['feature-grooming']?.checks ?? ['spec_lint'], await new Promise((res) => { let b = ''; process.stdin.on('data', (d) => (b += d)).on('end', () => res(b)); }), cfg)
-      : C.lintIssue(Number(n), 'feature-grooming', cfg);
-    console.log(r.ok ? `✓ #${n} spec passes` : `✗ #${n} spec: ${r.failures.length} problem(s)\n${r.failures.map((f) => `  - ${f}`).join('\n')}`);
+      ? C.runChecks(checks, await new Promise((res) => { let b = ''; process.stdin.on('data', (d) => (b += d)).on('end', () => res(b)); }), cfg, { issue: Number(n) })
+      : C.lintIssue(Number(n), stage, cfg);
+    console.log(r.ok ? `✓ #${n} ${kind} passes` : `✗ #${n} ${kind}: ${r.failures.length} problem(s)\n${r.failures.map((f) => `  - ${f}`).join('\n')}`);
     if (!r.ok) process.exitCode = 1;
   },
 
@@ -335,7 +338,7 @@ const help = `sf: software factory
   Run:      run · pause · resume · tick · observe · audit [--days 7]
   Watch:    dashboard [--port n]  (or SF_DASHBOARD_PORT, or dashboard.port in org.yaml; default 4340, next free port if taken)
   Work:     new "<title>" [--body ..] · approve <issue> · status · report [--days 7]
-  Tools:    lint spec <n> · contrast "#fg" "#bg"  (WCAG ratio)
+  Tools:    lint spec|build <n> · contrast "#fg" "#bg"  (WCAG ratio)
   Memory:   recall "<query>" · memory issue <n> | decisions | learnings`;
 
 if (!commands[cmd]) { console.log(help); process.exit(cmd ? 1 : 0); }

@@ -1,4 +1,5 @@
-import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, appendFileSync } from 'node:fs';
+import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { HOME, p, loadConfig, headcount, STAGE_ORDER, teamOf, holderOf, vendors, owners } from './config.mjs';
@@ -256,6 +257,8 @@ export class Dispatcher {
     const schema = verdictSchema(st.next, this.extra(stage));
     issue.comments ??= await T.viewIssue(this.repo, n).then((i) => i.comments).catch(() => []); // people's words go in the brief
     M.snapshotArtifact(n, stage); // the agent may rewrite its artifact file during the run; keep the version it starts from
+    const ownFile = p('memory/specs', `issue-${n}`, `${stage}.md`);
+    (this.before ??= new Map()).set(`${n}:${stage}`, existsSync(ownFile) ? readFileSync(ownFile, 'utf8') : ''); // what the guard compares against
     if (['review', 'security'].includes(stage) && Object.keys(state.prs ?? {}).length) {
       // A parent PR merged (often squashed) under this one: rebase first, rather than review code that can't merge (feedback b81be2c4).
       const conflicts = [];
@@ -289,7 +292,7 @@ export class Dispatcher {
       // Machine checks fail fast in the same session: the agent fixes its own artifact instead of a fresh run next tick.
       for (let i = 0; res.ok && st.checks?.length && res.out.outcome === 'advance' && i < (cfg.economy?.check_retries ?? 0); i++) {
         const { runChecks } = await import('./checks.mjs');
-        const c = runChecks(st.checks, this.artifactOf(n, stage, res), cfg);
+        const c = runChecks(st.checks, this.artifactOf(n, stage, res), cfg, { issue: n });
         if (c.ok || !res.session) break;
         M.record('check_retry', { stage, attempt: i + 1, failures: c.failures.slice(0, 20) }, { actor: role, issue: n });
         const again = await runAgent({ cfg, role, schema, cwd, issue: n, label: stage, meta: { ...meta, check_retry: i + 1 }, resume: res.session,
@@ -330,7 +333,9 @@ export class Dispatcher {
     // A planned dependency (feedback 4ef8402c): park the issue at this stage until the named issues merge or close. No council.
     const deps = v.outcome === 'wait' ? [...new Set((v.wait_for ?? []).map(Number).filter((m) => m && m !== n))] : [];
     if (deps.length) {
-      if (v.artifact_markdown?.trim()) M.saveArtifact(n, stage, this.artifactOf(n, stage, res));
+      const ownFile = p('memory/specs', `issue-${n}`, `${stage}.md`), before = this.before?.get(`${n}:${stage}`) ?? (existsSync(ownFile) ? readFileSync(ownFile, 'utf8') : ''), md = this.artifactOf(n, stage, res);
+      if (md?.trim() && !M.artifactRegression(before, md)) M.saveArtifact(n, stage, md);
+      else if (before) writeFileSync(ownFile, before); // a waiting note never replaces the stage's work
       for (const d of v.decisions ?? []) M.decide(d, { actor: role, issue: n });
       state.waitFor = deps; state.lastHandoff = { from: stage, by: role, text: v.handoff };
       M.saveIssueState(n, state);
@@ -359,8 +364,32 @@ export class Dispatcher {
 
     // An agent allowed to write its own artifact may have written the full document and returned only a summary:
     // the file it wrote during this run is the artifact, so it is never overwritten by the summary.
-    v.artifact_markdown = this.artifactOf(n, stage, res);
-    const artifact = M.saveArtifact(n, stage, v.artifact_markdown);
+    // A council's decision is not the stage's artifact (feedback 118f8faf, #68): it goes into the council thread, the stage's
+    // own artifact stays as it is, and the checks below run against that artifact.
+    const own = p('memory/specs', `issue-${n}`, `${stage}.md`), prevText = this.before?.get(`${n}:${stage}`) ?? (existsSync(own) ? readFileSync(own, 'utf8') : '');
+    let artifact;
+    if (fromCouncil) {
+      if (res.thread && v.artifact_markdown?.trim()) appendFileSync(p(res.thread), `\n## Chair's decision document\n${v.artifact_markdown.trim()}\n`);
+      artifact = res.thread ?? null;
+      if (prevText && existsSync(own) && readFileSync(own, 'utf8') !== prevText) writeFileSync(own, prevText); // no council member rewrites the stage's work
+      v.artifact_markdown = prevText;
+    } else {
+      v.artifact_markdown = this.artifactOf(n, stage, res);
+      const lost = M.artifactRegression(prevText, v.artifact_markdown);
+      if (lost) { // keep the previous version; the new text is kept beside the issue's threads, never lost
+        const kept = M.saveThread(`issue-${n}/${stage}-rejected-${Date.now()}`, `# ${stage} artifact not saved (${lost})\nBy ${role}, ${now().toISOString()}. The previous version was kept.\n\n${v.artifact_markdown}`);
+        writeFileSync(own, prevText); // the agent may have overwritten the file during its run
+        M.record('artifact_rejected', { stage, reason: lost, kept }, { actor: role, issue: n });
+        if (v.outcome === 'advance') {
+          state.lastHandoff = { from: `guard:${stage}`, by: 'dispatcher', text: `Your ${stage} artifact was not saved because ${lost}. The previous version is still in place (${own}). Revise that file in full and hand in again; what you returned is at ${p(kept)}.` };
+          M.saveIssueState(n, state);
+          await T.comment(repo, n, `### ✗ \`${stage}\` artifact not saved: ${lost}. The previous version was kept, so the ${role} revises it and hands in again.`);
+          return;
+        }
+        v.artifact_markdown = prevText;
+      } else M.saveArtifact(n, stage, v.artifact_markdown);
+      artifact = path.relative(p(), own);
+    }
     const adrs = (v.decisions ?? []).map((d) => M.decide(d, { actor: role, issue: n }));
     for (const l of v.learnings ?? []) M.learn(l, { actor: role, issue: n });
     for (const fb of v.feedback ?? []) { // the request and complaint box
@@ -390,7 +419,7 @@ export class Dispatcher {
       this.coe({ issue: n, kind: 'loop_back', from: stage, to: next, by: role, reason: `${v.summary}\n\nHandoff: ${v.handoff}` });
     }
     state.history.push({ ts: now().toISOString(), stage, to: next, outcome: v.outcome, by: role });
-    state.lastHandoff = { from: stage, by: role, text: v.handoff };
+    state.lastHandoff = { from: stage, by: role, text: fromCouncil && res.thread ? `${v.handoff}\n\nThe council's discussion and decision: ${p(res.thread)}` : v.handoff };
     if (v.risk_tier) state.risk = v.risk_tier;
     if (v.next_assignee && (cfg.pipeline[next]?.pool ?? []).includes(v.next_assignee)) state.assign = { ...state.assign, [next]: v.next_assignee };
     if (v.repos?.length) state.repos = v.repos;
@@ -507,7 +536,7 @@ export class Dispatcher {
     if (isLoop && state.loops > (cfg.loops.owner_after ?? 6)) return this.escalate(n, state, next, `Runaway: ${state.loops} loop-backs. Add \`${T.L.approved}\` to continue to \`${next}\`, or close the issue.`, owners(cfg));
     if (st.checks?.length && v.outcome === 'advance') { // machine checks first: the artifact must pass before anyone approves it
       const { runChecks } = await import('./checks.mjs');
-      const c = runChecks(st.checks, v.artifact_markdown, cfg);
+      const c = runChecks(st.checks, v.artifact_markdown, cfg, { issue: n });
       if (!c.ok) {
         state.lastHandoff = { from: `checks:${stage}`, by: 'dispatcher', text: `The ${stage} artifact failed ${st.checks.join(', ')}. Fix every item and advance again:\n${c.failures.map((f) => `- ${f}`).join('\n')}` };
         M.saveIssueState(n, state);
@@ -905,8 +934,14 @@ export class Dispatcher {
       .map((c) => `- **${c.author?.login ?? 'person'}** (${String(c.createdAt).slice(0, 16).replace('T', ' ')}): ${c.body.trim().slice(0, 1500)}`);
     const history = dossier.events.filter((e) => ['transition', 'check_failed', 'escalated', 'human_approved', 'vendor_request', 'loop_back', 'council_closed'].includes(e.type))
       .slice(-12).map((e) => `- ${e.ts.slice(0, 16).replace('T', ' ')} ${e.type}${e.stage ? ` ${e.stage}` : ''}${e.to ? ` → ${e.to}` : ''} (${e.actor})${e.summary ? `: ${e.summary.replace(/\s+/g, ' ').slice(0, 200)}` : ''}`);
-    const lint = !reviewing && (st.checks ?? []).includes('spec_lint')
-      ? `\n## Before you hand in\nWrite your draft to ${p('memory/specs', `issue-${n}`, `${stage}.md`)} and run \`sf lint spec ${n}\`. Fix every item it reports, then hand in. A spec that fails the lint comes straight back to you.` : '';
+    const lint = reviewing ? ''
+      : (st.checks ?? []).includes('spec_lint')
+        ? `\n## Before you hand in\nWrite your draft to ${p('memory/specs', `issue-${n}`, `${stage}.md`)} and run \`sf lint spec ${n}\`. Fix every item it reports, then hand in. A spec that fails the lint comes straight back to you.`
+        : (st.checks ?? []).includes('ac_evidence')
+          ? `\n## Before you hand in\nYour artifact must have a full \`## AC → evidence\` table (| AC | Test | Status |) with a row for every AC in the spec, restated in full on every revision. ` +
+            `Status is pass, or post-deploy (SRE) for checks that can only run after deploy. A partial, missing or failing AC means you don't advance: finish it, or loop back to tech-grooming. ` +
+            `Write the artifact to ${p('memory/specs', `issue-${n}`, `${stage}.md`)} and run \`sf lint build ${n}\` before handing in (owner request #69).`
+          : '';
     return [
       `# Issue #${n}: ${issue.title}`, `Tracker: ${repo} · ${issue.url ?? ''}`, `Now: ${now().toString()}`, '',
       `## Your stage: \`${stage}\``, st.goal, '',
