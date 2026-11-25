@@ -106,3 +106,12 @@ test('#5: a superseded dependency never sends merged code back to re-spec', asyn
   assert.equal(supersededRoute(c, {}, 'build'), 'feature-grooming', 'unmerged past feature-grooming: rework the spec');
   assert.equal(supersededRoute(c, {}, 'feature-grooming'), 'feature-grooming');
 });
+
+// #83: waited on #4, whose code had merged while the issue stayed open; triage re-ran every minute.
+test('#83: a dependency whose code has merged is not waited on again', async () => {
+  const { pendingDeps } = await import('../factory/lib/dispatcher.mjs');
+  const states = { 4: { merged: { enwallet: '2026-11-25T08:01:00Z' } }, 7: {}, 9: null };
+  const of = (m) => states[m];
+  assert.deepEqual(pendingDeps([4], of), [], 'merged code: the wait is over');
+  assert.deepEqual(pendingDeps([4, 7, 9], of), [7, 9], 'unmerged ones are still waited on');
+});

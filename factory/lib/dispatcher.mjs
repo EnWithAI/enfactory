@@ -135,6 +135,9 @@ export function repeatsAdvance(cfg, state, stage, artifact, events = []) {
 export function duplicateTransition(state, stage, next, outcome) {
   return outcome === 'advance' && stage !== next && state.moved?.from === stage && state.moved.to === next;
 }
+/** The dependencies still worth waiting for: those whose code has not merged yet. */
+export const pendingDeps = (deps, stateOf) => deps.filter((m) => !Object.keys(stateOf(m)?.merged ?? {}).length);
+
 /** Where an issue goes when a dependency it waited on closes without being done: unmerged work past feature-grooming
  *  reworks its spec; merged code, or anything earlier, stays at its stage. */
 export function supersededRoute(cfg, state, stage) {
@@ -344,6 +347,9 @@ export class Dispatcher {
           continue;
         }
         M.record('dependency_ready', { stage, waited_for: state.waitFor }, { issue: n });
+        // Say why the wait is over (#83 looped: #4's code had merged but the issue was still open, so the agent waited again).
+        const why = state.waitFor.map((m) => `#${m} ${open.has(m) ? 'has its code merged into the default branch (the issue itself may still be open)' : 'is closed'}`).join('; ');
+        state.lastHandoff = { from: 'dependency', by: 'dispatcher', text: `The wait is over: ${why}. Don't wait for ${state.waitFor.length > 1 ? 'them' : 'it'} again; carry on with this stage.` };
         state.waitFor = null; M.saveIssueState(n, state);
       }
       if (releaseMode) {
@@ -598,7 +604,14 @@ export class Dispatcher {
       v.question_for_human = `Still unfinished after ${max} continuation runs of ${stage}. ${v.question_for_human ?? ''}`.trim();
     }
     // A planned dependency (feedback 4ef8402c): park the issue at this stage until the named issues merge or close. No council.
-    const deps =v.outcome === 'wait' ? [...new Set((v.wait_for ?? []).map(Number).filter((m) => m && m !== n))] : [];
+    const asked = v.outcome === 'wait' ? [...new Set((v.wait_for ?? []).map(Number).filter((m) => m && m !== n))] : [];
+    const deps = pendingDeps(asked, (m) => M.issueState(m));
+    // Waiting on work whose code has already merged would loop (#83 re-waited on #4 every minute): the wait is over, so the
+    // verdict goes on to its next stage as an advance.
+    if (asked.length && !deps.length) {
+      M.record('wait_ignored', { stage, wait_for: asked, reason: 'already merged' }, { actor: role, issue: n });
+      v.outcome = v.next_stage && v.next_stage !== 'blocked' ? 'advance' : 'blocked';
+    }
     if (deps.length) {
       const ownFile = p('memory/specs', `issue-${n}`, `${stage}.md`), before = this.before?.get(`${n}:${stage}`) ?? (existsSync(ownFile) ? readFileSync(ownFile, 'utf8') : ''), md = this.artifactOf(n, stage, res);
       if (md?.trim() && !M.artifactRegression(before, md)) M.saveArtifact(n, stage, md);
