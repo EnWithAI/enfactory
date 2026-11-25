@@ -2,9 +2,11 @@
 # Local environment on this machine for a Node server app (enwallet, #64). Run from a checkout at the commit to deploy.
 #   build → releases/<sha> → stop the old server → switch `current` → start → probe → restore the previous release on failure.
 # Usage: local-node.sh <name> <env> <port> [--rollback]      (empty <port>: staging 4310, production 4311)
+#   `--rollback` may also come as argument 3 (an empty <port> collapsed by the caller's shell, #60). A production deploy is
+#   refused unless staging (127.0.0.1:${SF_STAGING_PORT:-4310}) reports ok, db and the same sha; a production rollback never asks staging.
 # Exit codes: 0 live · 1 deploy/rollback failed (nothing left half-switched) · 2 invalid input (no build ran)
 # Server contract: node <root>/current/server/index.mjs with HOST=127.0.0.1 PORT=<port>
-#   ENWALLET_DB=<root>/data/enwallet.db ENWALLET_SHA=<sha>; GET /api/health → 200 {"ok":true,"db":"ok","sha":"<sha>"}.
+#   ENWALLET_DB=<root>/data/enwallet.db ENWALLET_SHA=<sha>; GET /api/health → 200 {"ok":true,"db":true,"sha":"<sha>"}.
 # The store under <root>/data is never copied, moved or deleted here.
 set -euo pipefail
 umask 077 # [S4] deploy.log, server.log, server.pid, releases/ and data/ are owner-only.
@@ -19,6 +21,8 @@ valid_id() { [[ ${1:-} =~ ^[0-9a-f]{7,40}$ ]]; } # [S7] every release id passes 
 # 1-2. Arguments and inputs [S6]. Nothing is written until these pass.
 (( $# <= 4 )) || die 2 "✗ too many arguments ($#; usage: local-node.sh <name> <env> <port> [--rollback])"
 name=${1:-} env=${2:-} port=${3:-} flag=${4:-}
+# The dispatcher's rollback call collapses an empty {port}, so `--rollback` can arrive as $3 (#60).
+if [[ $port == --rollback && -z $flag ]]; then port="" flag=--rollback; fi
 [[ -z $flag || $flag == --rollback ]] || die 2 "✗ invalid flag: $(q "$flag") (expected --rollback)"
 [[ $name =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] || die 2 "✗ invalid repo name: $(q "$name") (expected ^[a-z0-9][a-z0-9-]{0,63}\$)"
 [[ $env == staging || $env == production ]] || die 2 "✗ invalid environment: $(q "$env") (expected staging or production)"
@@ -49,6 +53,14 @@ log "· port $port"
 if [[ -n ${HOST+set} && $HOST != 127.0.0.1 ]]; then
   die 2 "✗ refusing bind: HOST=$(q "$HOST") (only 127.0.0.1 allowed)"
 fi
+# 6. Staging port the production gate asks (#60) [S6]: same rule as <port>. Only a production deploy reads it.
+sport=${SF_STAGING_PORT:-4310}
+if [[ $env == production && $mode == deploy ]] && { ! [[ $sport =~ ^[1-9][0-9]{3,4}$ ]] || (( sport < 1024 || sport > 65535 )); }; then
+  die 2 "✗ invalid SF_STAGING_PORT: $(q "$sport") (expected an integer 1024-65535)"
+fi
+# 7. Node 26+ (node:sqlite), checked before anything is stopped or built (#60).
+nv=$(node -p 'process.versions.node' 2>/dev/null || echo none)
+if ! [[ ${nv%%.*} =~ ^[0-9]+$ ]] || (( ${nv%%.*} < 26 )); then die 1 "✗ node 26+ required (found $(q "$nv"))"; fi
 
 # shellcheck disable=SC2329 # invoked by the ERR trap below
 on_err() {
@@ -109,13 +121,17 @@ start() {
 }
 
 # [S8] Loopback only, no proxy, http only. The health body and the sha go to node as stdin and argv, never as source.
+curl=(curl -fsS --max-time 2 --noproxy '*' --proto '=http')
+# health_ok <url> <sha>: 0 only for 200 {"ok":true,"db":true,"sha":<sha>} (strict booleans, #60). Non-200 or non-JSON fails.
+health_ok() {
+  "${curl[@]}" "$1" 2>/dev/null | node -e '
+    let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
+      try { const j = JSON.parse(s); process.exit(j.ok === true && j.db === true && j.sha === process.argv[1] ? 0 : 1); } catch { process.exit(1); }
+    });' "$2"
+}
 healthy() {
   local id=$1 base="http://127.0.0.1:$port" html asset
-  local curl=(curl -fsS --max-time 2 --noproxy '*' --proto '=http')
-  "${curl[@]}" "$base/api/health" 2>/dev/null | node -e '
-    let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
-      try { const j = JSON.parse(s); process.exit(j.ok === true && j.sha === process.argv[1] ? 0 : 1); } catch { process.exit(1); }
-    });' "$id" || return 1
+  health_ok "$base/api/health" "$id" || return 1
   html=$("${curl[@]}" "$base/" 2>/dev/null) || return 1
   asset=$(grep -oE 'assets/[^"]+\.js' <<<"$html" | head -1) || return 1
   [[ -n $asset ]] && "${curl[@]}" -o /dev/null "$base/$asset" 2>/dev/null
@@ -163,6 +179,11 @@ step=preflight; guard_port
 [[ -f server/index.mjs ]] || die 1 "✗ missing precondition: server/index.mjs"
 node -e 'const p = JSON.parse(require("fs").readFileSync("package.json", "utf8")); process.exit(typeof p?.scripts?.build === "string" ? 0 : 1)' 2>/dev/null \
   || die 1 "✗ missing precondition: package.json scripts.build"
+# Production only takes a build that staging already serves healthy on the same sha (#60). Before npm, so a refusal changes nothing.
+if [[ $env == production ]]; then
+  step=gate; log "· gate: staging 127.0.0.1:$sport reports $sha"
+  health_ok "http://127.0.0.1:$sport/api/health" "$sha" || die 1 "✗ staging is not healthy on $sha"
+fi
 
 step=build; log "· build: npm ci --ignore-scripts && npm run build"
 npm ci --ignore-scripts --no-audit --no-fund --loglevel=error 2>&1 | tee -a "$LOG"

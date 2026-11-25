@@ -155,7 +155,11 @@ for production.
   never touched), `deploy.log`, `server.log`, `server.pid`, `VERSION` (last passing deploy) and `VERIFIED` (written by the dispatcher after SRE
   verify). Everything is owner-only. The 5 newest releases are kept, plus VERIFIED and current.
 - **Server contract:** `node <root>/current/server/index.mjs` with `HOST=127.0.0.1`, `PORT`, `ENWALLET_DB=<root>/data/enwallet.db`,
-  `ENWALLET_SHA=<sha>`; `GET /api/health` returns 200 `{"ok":true,"db":"ok","sha":"<sha>"}`. A `HOST` other than 127.0.0.1 is refused.
+  `ENWALLET_SHA=<sha>`; `GET /api/health` returns 200 `{"ok":true,"db":true,"sha":"<sha>"}` (`db` is the boolean `true`). A `HOST` other
+  than 127.0.0.1 is refused.
+- **Production gate (#60):** a production deploy runs only if staging at `127.0.0.1:${SF_STAGING_PORT:-4310}` reports `ok`, `db` and the
+  same sha; otherwise it exits 1 before npm. A production `--rollback` never asks staging. `--rollback` may also be argument 3 (empty
+  `<port>`), and Node 26+ is checked before anything runs.
 - **Probe:** `/api/health` (ok and sha), `/` and its first `assets/*.js`, on `http://127.0.0.1:<port>` only, 10 tries. A failed probe
   restores the previous release. `--rollback` goes to VERIFIED only, with no build and no fallback.
 - **Exit codes:** 0 live, 1 failed (previous release restored, or nothing changed), 2 invalid input (nothing built).

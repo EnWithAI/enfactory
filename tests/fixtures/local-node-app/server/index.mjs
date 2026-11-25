@@ -1,5 +1,6 @@
-// Fixture server for tests/local-node.test.mjs. Honours the #64 server contract (HOST, PORT, ENWALLET_DB, ENWALLET_SHA).
-// server/mode selects the health answer: ok (default), 500, or badsha (200 with the wrong sha).
+// Fixture server for tests/local-node.test.mjs and tests/local-node-delta.test.mjs. Honours the #64 server contract
+// (HOST, PORT, ENWALLET_DB, ENWALLET_SHA). server/mode selects the health answer: ok (default, db:true), 500, badsha (200 with
+// the wrong sha), and for #60: dbfalse (db:false), dbstring (db:"ok"), nodb (no db field), okfalse (ok:false), nojson (200 `not json`).
 import { createServer } from 'node:http';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, normalize } from 'node:path';
@@ -15,8 +16,12 @@ if (FIXTURE_TRACE) writeFileSync(FIXTURE_TRACE, JSON.stringify({ argv1: process.
 createServer((req, res) => {
   if (req.url === '/api/health') {
     if (mode === '500') { res.writeHead(500); res.end('{}'); return; }
+    if (mode === 'nojson') { res.writeHead(200); res.end('not json'); return; }
+    const db = { dbfalse: false, dbstring: 'ok' }[mode] ?? true;
+    const body = { ok: mode !== 'okfalse', db, sha: mode === 'badsha' ? 'deadbee' : ENWALLET_SHA };
+    if (mode === 'nodb') delete body.db;
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, db: 'ok', sha: mode === 'badsha' ? 'deadbee' : ENWALLET_SHA }));
+    res.end(JSON.stringify(body));
     return;
   }
   const rel = normalize(req.url === '/' ? 'index.html' : req.url.slice(1));
