@@ -148,6 +148,18 @@ builds the default branch, copies it to `~/factory-envs/<repo>/<env>/releases/<s
 on the configured port. It health-checks the page and its JS bundle, and rolls back to the previous release on failure. A failed deploy
 sends the issue back to `build` with the log.
 
+`deploy/local-node.sh` does the same for an app with a Node server (enwallet, #64). Usage:
+`local-node.sh <name> <env> <port> [--rollback]`. `<env>` is `staging` or `production`, and an empty `<port>` means 4310 for staging and 4311
+for production.
+- **Root** `${SF_ENV_ROOT:-~/factory-envs}/<name>/<env>`: `releases/<sha>` (dist, server, src/shared), `current` link, `data/` (the store,
+  never touched), `deploy.log`, `server.log`, `server.pid`, `VERSION` (last passing deploy) and `VERIFIED` (written by the dispatcher after SRE
+  verify). Everything is owner-only. The 5 newest releases are kept, plus VERIFIED and current.
+- **Server contract:** `node <root>/current/server/index.mjs` with `HOST=127.0.0.1`, `PORT`, `ENWALLET_DB=<root>/data/enwallet.db`,
+  `ENWALLET_SHA=<sha>`; `GET /api/health` returns 200 `{"ok":true,"db":"ok","sha":"<sha>"}`. A `HOST` other than 127.0.0.1 is refused.
+- **Probe:** `/api/health` (ok and sha), `/` and its first `assets/*.js`, on `http://127.0.0.1:<port>` only, 10 tries. A failed probe
+  restores the previous release. `--rollback` goes to VERIFIED only, with no build and no fallback.
+- **Exit codes:** 0 live, 1 failed (previous release restored, or nothing changed), 2 invalid input (nothing built).
+
 ## AWS: deploy and validate
 
 `release` → staging → `verify` → `release` → production → `verify` → done. The release-manager applies `release.policy` to pick
