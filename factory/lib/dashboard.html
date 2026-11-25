@@ -1368,7 +1368,9 @@ function renderSpend(s) {
   $('spend-kpis').replaceChildren(
     ...[[usd(sp.today.cost), `today · ${sp.today.runs} runs`], [usd(sp.week.cost), `last 7 days · ${sp.week.runs} runs`], [usd(sp.all.cost), `all time · ${sp.all.runs} runs`],
       [usd(sp.all.runs ? sp.all.cost / sp.all.runs : 0), 'average per run'],
-      [`${usd(sp.rework)} (${sp.all.cost ? Math.round((100 * sp.rework) / sp.all.cost) : 0}%)`, 'rework: repeat runs, councils, check retries']]
+      [`${usd(sp.rework.rework)} (${sp.rework.cost ? Math.round((100 * sp.rework.rework) / sp.rework.cost) : 0}%)`,
+        `rework today (target 10%): ${Object.entries(sp.rework.causes).filter(([, v]) => v >= 0.5).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${usd(v)}`).join(' · ') || 'none'}` +
+        (sp.rework.continuation >= 0.5 ? ` · plus ${usd(sp.rework.continuation)} continuing after answers (not rework)` : '')]]
       .map(([b, t]) => el('div', {}, el('b', {}, b), el('span', {}, t))));
   const tabs = SPEND_TABS.filter(([k]) => k !== 'compare' || sp.switched);
   if (!tabs.some(([k]) => k === spendTab)) spendTab = 'role';

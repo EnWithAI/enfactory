@@ -594,6 +594,8 @@ economy:
   resume_minutes: 60
   check_retries: 2
   council_rounds: 1
+  councils_per_stage: 1 # councils per issue and stage until a person approves; a repeat block goes to the owner
+  continue_runs: 2 # "continue" runs (sound but unfinished) per stage before it counts as a block
   brief_kb: 40
   tasks:
     - { task: triage, model: claude-haiku-5-5, effort: low, budget_usd: 0.5 }

@@ -12,6 +12,7 @@ import { runAgent } from './worker.mjs';
 import { createIssue, gh, humanComment, editLabels, closeIssue, MARK } from './tracker.mjs';
 import { tree as libraryTree } from './library.mjs';
 import { list as feedbackList } from './hr.mjs';
+import { rework as reworkOf } from './rework.mjs';
 
 export const DEFAULT_PORT = 4340;
 const list = (dir, ext = '.md') => (existsSync(p(dir)) ? readdirSync(p(dir)).filter((f) => f.endsWith(ext)).sort() : []);
@@ -89,14 +90,8 @@ function spend(evs) {
     return Object.values(g).map((x) => ({ ...x, avgCost: x.cost / x.runs, avgTurns: x.measured ? x.turns / x.measured : null, avgTokens: x.measured ? x.tokens / x.measured : null }))
       .sort((a, b) => b.cost - a.cost);
   };
-  // Rework: every run after the first of the same role on the same issue and task, plus councils and check retries.
-  const seen = new Set();
-  let rework = 0;
-  for (const e of runs) {
-    const k = `${e.actor}|${e.issue}|${taskOf(e.label)}`;
-    if (e.issue && (seen.has(k) || /^council-/.test(e.label) || e.check_retry)) rework += e.cost_usd ?? 0;
-    seen.add(k);
-  }
+  // Rework today (UTC), by cause; work picked up after an answer or a dependency is continuation, not rework (rework.mjs).
+  const rework = reworkOf(evs, { since: new Date().toISOString().slice(0, 10) });
   const window = (list) => ({ runs: list.length, cost: list.reduce((s, e) => s + (e.cost_usd ?? 0), 0) });
   // Before and after the economy rules, per task: the fair comparison is the average cost of the same kind of run.
   const compare = switched ? (() => {

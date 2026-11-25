@@ -28,7 +28,7 @@ export function verdictSchema(nextOptions, extra = {}) {
   return {
     type: 'object',
     properties: {
-      outcome: { enum: ['advance', 'loop_back', 'reject', 'blocked', 'needs_vendor', 'wait', 'already_satisfied'] },
+      outcome: { enum: ['advance', 'loop_back', 'reject', 'blocked', 'needs_vendor', 'wait', 'already_satisfied', 'continue'] },
       // One loop-back classification (governance decision, owner request #155): why work went back, and where the defect began.
       loop_cause: { enum: ['requirement', 'design', 'code', 'test', 'premise', 'format', 'environment', 'dependency', 'other'],
         description: 'With outcome loop_back: the kind of defect that sends this back.' },

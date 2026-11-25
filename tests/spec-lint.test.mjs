@@ -46,3 +46,29 @@ test('the premise rule judges each #N by its own clause', () => {
   const r = specLint(spec, cfg);
   assert.ok(!r.failures.some((f) => /cites #9 as pending/.test(f)), 'the answered #9 is not blamed for #999999 being pending');
 });
+
+// Rework review (2026-11-25): 45 "no family" failures were well-formed ACs in a tag style the lint didn't read.
+const tagged = (head, body = '') => `# Spec\n## 3. Acceptance criteria\n${head}\n${body}`;
+const tagFailures = (md) => specLint(md, cfg).failures.filter((f) => /^AC-9-01: (no family|no verify|family|verify)/.test(f));
+
+test('family and verify are read in every tag style specs use', () => {
+  for (const head of [
+    '**AC-9-01** (verify: e2e, family: a11y). No horizontal scroll.',
+    '**AC-9-01** (verify: e2e, family: a11y, §4c). No horizontal scroll.',
+    '**AC-9-01 Banner shows.** `verify: e2e` · `family: ux` · `control: AC-D1`',
+    '- **AC-9-01 Drift warns.** [verify: unit] [family: contract] [control: ADR 1]',
+    '| **AC-9-01** | Given x, then y | ux | e2e |',
+  ]) assert.deepEqual(tagFailures(tagged(head)), [], head);
+});
+
+test('a missing or invented tag still fails, with the format to use', () => {
+  assert.match(tagFailures(tagged('**AC-9-01** (family: ux). No verify here.'))[0], /no verify method\. Tag it on the AC's own line/);
+  assert.match(tagFailures(tagged('**AC-9-01** (verify: test, family: supply-chain). x'))[0], /family "supply-chain" is not one of/);
+});
+
+test('a bold AC header owns its unindented Given/When/Then bullets', () => {
+  const ok = tagged('**AC-9-01** (verify: doc, family: doc). Tokens only.', '- When `grep -rn px src/ | wc -l` runs.\n- Then it prints 0.\n');
+  assert.deepEqual(specLint(ok, cfg).failures.filter((f) => f.startsWith('AC-9-01: verify doc')), []);
+  const named = tagged('**AC-9-01** (verify: doc, family: doc). Tokens only.', '- When command C08 runs.\n- Then it prints 0.\n');
+  assert.equal(specLint(named, cfg).failures.filter((f) => f.startsWith('AC-9-01: verify doc')).length, 1);
+});

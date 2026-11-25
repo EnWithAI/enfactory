@@ -1,5 +1,6 @@
 // Analytics over the ledger. Used by `sf report` and fed to the auditor.
 import { events } from './memory.mjs';
+import { rework } from './rework.mjs';
 
 const fmt = (ms) => (ms < 3600e3 ? `${Math.round(ms / 60e3)}m` : `${(ms / 3600e3).toFixed(1)}h`);
 const table = (head, rows) => [`| ${head.join(' | ')} |`, `|${head.map(() => '---').join('|')}|`, ...rows.map((r) => `| ${r.join(' | ')} |`)].join('\n');
@@ -63,6 +64,14 @@ export function report({ days = 7 } = {}) {
       for (const t of trans.filter((x) => x.loop)) { const k = `${t.loop_cause ?? 'unclassified'}|${t.origin_stage ?? '–'}`; c[k] = (c[k] ?? 0) + 1; }
       return Object.entries(c).sort((a, b) => b[1] - a[1]).map(([k, n]) => [...k.split('|'), n]);
     })()),
+    '', '## Rework (target 10% of spend)',
+    // Repeat work by cause; picking up after an answer or a dependency is continuation, not rework (rework review, 2026-11-25).
+    (() => {
+      const r = rework(events(), { since });
+      const pct = (v) => (r.cost ? `${Math.round((100 * v) / r.cost)}%` : '–');
+      return `${table(['cause', 'cost', 'share of spend'], [...Object.entries(r.causes).sort((a, b) => b[1] - a[1]).map(([k, v]) => [k, `$${v.toFixed(2)}`, pct(v)]),
+        ['**rework total**', `$${r.rework.toFixed(2)}`, pct(r.rework)]])}\n\nContinuation (new work after an answer, a dependency or a planned continue): $${r.continuation.toFixed(2)}.`;
+    })(),
     '', '## Waste signals (target 0)',
     // Runs and stages that produced nothing (owner request #145): what the economy and pipeline fixes should drive to zero.
     table(['signal', 'count', 'issues'], [
@@ -71,6 +80,7 @@ export function report({ days = 7 } = {}) {
       ['found already done before build (already_satisfied)', 'already_satisfied'],
       ['stage re-run blocked after an advance (redispatch_blocked)', 'redispatch_blocked'],
       ['duplicate transition ignored (duplicate_transition)', 'duplicate_transition'],
+      ['second council on the same stage, sent to the owner instead (council_skipped)', 'council_skipped'],
     ].map(([label, type]) => { const xs = evs.filter((e) => e.type === type); return [label, xs.length, [...new Set(xs.map((e) => `#${e.issue}`))].join(' ') || '–']; })),
     '', '## Escalations',
     escalations.map((e) => `- #${e.issue}: ${e.message?.split('\n')[0]}`).join('\n') || '_none_',

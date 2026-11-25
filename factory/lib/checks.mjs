@@ -24,6 +24,14 @@ function sections(md) {
   return out;
 }
 
+/** A `key: value` tag on an AC, in any of the forms specs use: `[family: a11y]`, `(verify: e2e, family: a11y)`,
+ *  `` `family: ux` · ``. The value ends at a bracket, backtick, middle dot, semicolon, newline, ". " or the next `, key:`.
+ *  Only the bracket form was read before, so 45 well-formed ACs failed "no family" (rework review, 2026-11-25). */
+function tag(line, key) {
+  const m = line.match(new RegExp(String.raw`\b${key}:\s*([^\]\)\`·;\n]+)`, 'i'));
+  return m ? m[1].split(/,\s*(?=[a-z][\w-]*:|§)/i)[0].replace(/\.(\s.*)?$/, '').trim() || undefined : undefined;
+}
+
 /** Acceptance criteria in either house format: table rows `| **AC-n-m** | text | family | verify |` or bullets with [family:]/[verify:] tags. */
 function acs(md) {
   const rows = [];
@@ -38,8 +46,10 @@ function acs(md) {
     if (!id) continue;
     let line = lines[i];
     // A bullet AC runs on through its indented lines (blank lines included) until the next AC, a heading, or an unindented line.
-    if (!line.trim().startsWith('|')) for (let j = i + 1; j < lines.length && !start.test(lines[j]) && !/^#{1,6}\s/.test(lines[j]) && (!lines[j].trim() || /^\s/.test(lines[j])); j++) line += `\n${lines[j]}`;
-    let family = line.match(/\[family:\s*([^\]]+)\]/i)?.[1], verify = line.match(/\[verify:\s*([^\]]+)\]/i)?.[1], text = line;
+    // A bold `**AC-…**` header owns everything under it (its Given/When/Then bullets are not indented) until the next AC or heading.
+    const header = /^\s*\*\*AC-/i.test(line);
+    if (!line.trim().startsWith('|')) for (let j = i + 1; j < lines.length && !start.test(lines[j]) && !/^#{1,6}\s/.test(lines[j]) && (header || !lines[j].trim() || /^\s/.test(lines[j])); j++) line += `\n${lines[j]}`;
+    let family = tag(line, 'family'), verify = tag(line, 'verify'), text = line;
     if (line.trim().startsWith('|') && (!family || !verify)) {
       const cells = line.split('|').slice(1, -1).map((c) => c.trim());
       if (cells.length >= 4) { text = cells[1]; family ??= cells[2]; verify ??= cells[3]; }
@@ -86,9 +96,9 @@ export function specLint(md, cfg) {
   }
   // (2) family and verify values come from the org's lists
   for (const a of list) {
-    if (!a.family.length) failures.push(`${a.id}: no family.`);
+    if (!a.family.length) failures.push(`${a.id}: no family. Tag it on the AC's own line, e.g. \`(verify: e2e, family: a11y)\`.`);
     for (const f of a.family) if (families.size && !families.has(f)) failures.push(`${a.id}: family "${f}" is not one of ${[...families].join(', ')}.`);
-    if (!a.verify.length) failures.push(`${a.id}: no verify method.`);
+    if (!a.verify.length) failures.push(`${a.id}: no verify method. Tag it on the AC's own line, e.g. \`(verify: e2e, family: a11y)\`.`);
     for (const v of a.verify) if (verifies.size && !verifies.has(v)) failures.push(`${a.id}: verify "${v}" is not one of ${[...verifies].join(', ')}.`);
     // (3) a doc check states the command that proves it
     if (a.verify.includes('doc') && !CMD.test(a.line)) failures.push(GH_ANY.test(a.line)

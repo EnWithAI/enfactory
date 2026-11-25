@@ -135,6 +135,14 @@ export function repeatsAdvance(cfg, state, stage, artifact, events = []) {
 export function duplicateTransition(state, stage, next, outcome) {
   return outcome === 'advance' && stage !== next && state.moved?.from === stage && state.moved.to === next;
 }
+/** Whether a `continue` verdict may run the stage again (economy.continue_runs per stage; reset by any other outcome). */
+export function mayContinue(cfg, state, stage) {
+  const max = cfg.economy?.continue_runs ?? 2, done = state.continues?.[stage] ?? 0;
+  return { ok: done < max, done, max };
+}
+/** Whether a council may be held for this key (a stage, or `loop:<stage>`): economy.councils_per_stage until a person approves. */
+export const mayConvene = (cfg, state, key) => (state.councils?.[key] ?? 0) < (cfg.economy?.councils_per_stage ?? 1);
+
 /**
  * How the brief shows the last handoff to `stage` (feedback 0333ef04, #77). "What must change" is only for work sent back: a loop-back
  * from a later stage, a failed check, CI, the artifact guard, an approver, a person. An agent's own handoff onward from this stage
@@ -556,8 +564,29 @@ export class Dispatcher {
     const v = res.out;
     const role = st.council ? st.council.chair : this.pickRole(stage, st, state);
     const order = STAGE_ORDER(cfg);
+    // Sound but unfinished (rework review, 2026-11-25: #6's engineer ran out of time, and with no way to say so it went through
+    // 3 councils and 3 loops to tech-grooming just to come back to build). The same role continues its own session next tick:
+    // no council, no loop. After economy.continue_runs it becomes a block like any other.
+    if (v.outcome !== 'continue' && state.continues?.[stage]) delete state.continues[stage];
+    if (v.outcome === 'continue') {
+      const { ok, done, max } = mayContinue(cfg, state, stage);
+      if (ok) {
+        const ownFile = p('memory/specs', `issue-${n}`, `${stage}.md`), before = this.before?.get(`${n}:${stage}`) ?? (existsSync(ownFile) ? readFileSync(ownFile, 'utf8') : ''), md = this.artifactOf(n, stage, res);
+        if (md?.trim() && !M.artifactRegression(before, md)) M.saveArtifact(n, stage, md);
+        else if (before) writeFileSync(ownFile, before);
+        for (const d of v.decisions ?? []) M.decide(d, { actor: role, issue: n });
+        state.continues = { ...(state.continues ?? {}), [stage]: done + 1 };
+        state.lastHandoff = { from: `continue:${stage}`, by: role, text: `You stopped with this stage unfinished. Pick up where you left off:\n${v.handoff}` };
+        M.saveIssueState(n, state);
+        M.record('continued', { stage, run: done + 1, of: max, summary: v.summary?.slice(0, 500), cost_usd: res.cost }, { actor: role, issue: n });
+        await T.comment(repo, n, `### ⏩ ${role} · \`${stage}\` continues (${done + 1} of ${max})\n${v.summary}`);
+        return;
+      }
+      v.outcome = 'blocked';
+      v.question_for_human = `Still unfinished after ${max} continuation runs of ${stage}. ${v.question_for_human ?? ''}`.trim();
+    }
     // A planned dependency (feedback 4ef8402c): park the issue at this stage until the named issues merge or close. No council.
-    const deps = v.outcome === 'wait' ? [...new Set((v.wait_for ?? []).map(Number).filter((m) => m && m !== n))] : [];
+    const deps =v.outcome === 'wait' ? [...new Set((v.wait_for ?? []).map(Number).filter((m) => m && m !== n))] : [];
     if (deps.length) {
       const ownFile = p('memory/specs', `issue-${n}`, `${stage}.md`), before = this.before?.get(`${n}:${stage}`) ?? (existsSync(ownFile) ? readFileSync(ownFile, 'utf8') : ''), md = this.artifactOf(n, stage, res);
       if (md?.trim() && !M.artifactRegression(before, md)) M.saveArtifact(n, stage, md);
@@ -650,7 +679,10 @@ export class Dispatcher {
     const isLoop = !st.council && !(st.forward ?? []).includes(next) && order.includes(next) && order.indexOf(next) < order.indexOf(stage);
 
     // Repeated loop-backs: the agents involved discuss the route instead of one agent deciding alone.
-    if (isLoop && !fromCouncil && this.loopsSince(state) + 1 >= (cfg.loops.council_after ?? 2)) {
+    const loopKey = `loop:${stage}`;
+    if (isLoop && !fromCouncil && this.loopsSince(state) + 1 >= (cfg.loops.council_after ?? 2) && mayConvene(cfg, state, loopKey)) {
+      state.councils = { ...(state.councils ?? {}), [loopKey]: (state.councils?.[loopKey] ?? 0) + 1 };
+      M.saveIssueState(n, state);
       const target = cfg.pipeline[next];
       const members = [...new Set([role, target.role ?? target.council?.chair, 'product-manager'].filter(Boolean))];
       const c = await council({
@@ -857,12 +889,21 @@ export class Dispatcher {
     }
     // A decision beyond this agent's authority → the org decides (council chaired by the chief of staff), not a person.
     if (next === 'blocked') {
+      // One council per issue and stage until a person approves (rework review: #20 and #42 each had 3 "could not decide"
+      // councils). A second block on the same stage goes straight to the owner with the question.
+      const held = state.councils?.[stage] ?? 0;
+      if (!fromCouncil && !mayConvene(cfg, state, stage)) {
+        M.record('council_skipped', { stage, held }, { actor: role, issue: n });
+        return this.escalate(n, state, null, `Blocked again in \`${stage}\`, after a council already ruled on it.\n\n${v.question_for_human || v.summary}`, owners(cfg));
+      }
       if (!fromCouncil) {
+        state.councils = { ...(state.councils ?? {}), [stage]: held + 1 };
+        M.saveIssueState(n, state);
         const lead = cfg.teams[teamOf(cfg, role)]?.lead;
         const head = Object.values(cfg.departments ?? {}).find((d) => d.teams?.includes(teamOf(cfg, role)))?.head; // first escalation point
         const c = await council({ cfg, name: `issue-${n}/blocked-${stage}-${Date.now()}`, topic: `#${n}: the ${role} is blocked in ${stage}. Decide.`,
           context: `${this.context(issue, stage, state, cwd, { kb: 12, reviewing: true })}\n\n## What blocked the ${role}\n${v.summary}\n\n${v.question_for_human ?? ''}\n${v.handoff}`,
-          chair: 'chief-of-staff', members: [...new Set([role, lead, head, 'product-owner'].filter(Boolean))], rounds: 2, nextOptions: st.next, issue: n, cwd, extraSchema: this.extra(stage) });
+          chair: 'chief-of-staff', members: [...new Set([role, lead, head, 'product-owner'].filter(Boolean))], rounds: cfg.economy?.council_rounds ?? 2, nextOptions: st.next, issue: n, cwd, extraSchema: this.extra(stage) });
         if (c.ok) return this.apply(issue, stage, c, state, cwd, { fromCouncil: true });
       }
       return this.escalate(n, state, null, `The council could not decide.\n\n${v.question_for_human || v.summary}`, owners(cfg));
@@ -966,7 +1007,7 @@ export class Dispatcher {
     else if (state.pending && state.pending !== stage) await this.move(issue, stage, state.pending, state);
     M.record('human_approved', { stage, to: state.pending, escalations: (state.escalations ?? 0) + 1, loops: state.loops }, { actor: 'human', issue: n });
     // The loop history is kept (owner request #109): thresholds count loops since this approval, and approvals are counted.
-    state.pending = null; state.loopBase = state.loops; state.escalations = (state.escalations ?? 0) + 1; state.failures = 0; state.personStage = null;
+    state.pending = null; state.loopBase = state.loops; state.escalations = (state.escalations ?? 0) + 1; state.failures = 0; state.personStage = null; state.councils = {};
     M.saveIssueState(n, state);
   }
 
@@ -1534,7 +1575,7 @@ export class Dispatcher {
         `Don't re-read them or re-run \`gh issue view\` and \`sf memory issue\`. Spend your steps on the work itself; read the full documents only for a specific gap.`,
       lint,
       `\n## Choose next_stage from`, opts,
-      `\nUse \`advance\` to move forward, \`loop_back\` to send work upstream (say exactly what must change in \`handoff\`), \`reject\` to cut the issue (it closes where \`rejected\` is one of your options; elsewhere the product owner decides the cut), \`wait\` with \`wait_for\` when the plan says this issue must wait for other issues (no council; it resumes by itself),, \`already_satisfied\` with \`satisfied_by\` (file:lines or a commit) when the work already exists (before build only; the product owner confirms and it closes as done), and \`blocked\` only when a decision is needed.`,
+      `\nUse \`advance\` to move forward, \`loop_back\` to send work upstream (say exactly what must change in \`handoff\`), \`reject\` to cut the issue (it closes where \`rejected\` is one of your options; elsewhere the product owner decides the cut), \`wait\` with \`wait_for\` when the plan says this issue must wait for other issues (no council; it resumes by itself), \`continue\` when the approach is sound but you ran out of time or turns (put what is left in \`handoff\`; you resume your own session next, with no council or loop), \`already_satisfied\` with \`satisfied_by\` (file:lines or a commit) when the work already exists (before build only; the product owner confirms and it closes as done), and \`blocked\` only when a decision is needed.`,
       `Put the full stage artifact in \`artifact_markdown\`.`,
     ].join('\n');
   }
