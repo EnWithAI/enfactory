@@ -495,10 +495,11 @@ export class Dispatcher {
     (this.before ??= new Map()).set(`${n}:${stage}`, existsSync(ownFile) ? readFileSync(ownFile, 'utf8') : ''); // what the guard compares against
     if (['review', 'security'].includes(stage) && Object.keys(state.prs ?? {}).length) {
       // A parent PR merged (often squashed) under this one: rebase first, rather than review code that can't merge (feedback b81be2c4).
-      const conflicts = [];
+      let conflicts = [];
       for (const [name, pr] of Object.entries(state.prs)) {
         if (!state.merged?.[name] && (await T.prMergeable(this.repoByName(name).repo, pr).catch(() => null)) === 'CONFLICTING') conflicts.push(name);
       }
+      if (conflicts.length) conflicts = await this.rebaseConflicts(n, state, conflicts);
       if (conflicts.length) {
         state.lastHandoff = { from: stage, by: 'git', text: `The PR(s) now conflict with the default branch in: ${conflicts.join(', ')} (an earlier PR merged underneath). In each, run \`git fetch origin && git rebase origin/<default>\`, resolve the conflicts keeping both changes' intent, re-run all tests, commit and hand back to review.` };
         M.saveIssueState(n, state);
@@ -1050,8 +1051,13 @@ export class Dispatcher {
       return this.move(issue, 'merge', 'build', state);
     }
     // Another issue merged first and touched the same files → the engineer rebases.
-    const conflicts = [];
+    let conflicts = [];
     for (const [name, pr] of prs) if ((await T.prMergeable(this.repoByName(name).repo, pr)) === 'CONFLICTING') conflicts.push(name);
+    if (conflicts.length) {
+      const before = conflicts.length;
+      conflicts = await this.rebaseConflicts(n, state, conflicts);
+      if (!conflicts.length && before) return; // rebased: merge waits for CI on the new commits next tick
+    }
     if (conflicts.length) {
       state.loops += 1;
       state.lastHandoff = { from: 'merge', by: 'git', text: `PR(s) conflict with the default branch in: ${conflicts.join(', ')}. In each, run \`git fetch origin && git rebase origin/<default>\`, resolve the conflicts keeping both changes' intent, re-run all tests, and commit.` };
@@ -1063,7 +1069,10 @@ export class Dispatcher {
       return this.move(issue, 'merge', 'build', state);
     }
     const checks = {};
-    for (const [name, pr] of prs) checks[name] = await T.prChecks(this.repoByName(name).repo, pr);
+    for (const [name, pr] of prs) {
+      checks[name] = await T.prChecks(this.repoByName(name).repo, pr);
+      if (checks[name] === 'none' && state.awaitCi?.[name]) checks[name] = 'pending'; // rebased: never merge before CI has run on it
+    }
     if (Object.values(checks).includes('pending')) return;
     const failed = Object.entries(checks).filter(([, c]) => c === 'fail').map(([name]) => name);
     if (failed.length) {
@@ -1378,6 +1387,29 @@ export class Dispatcher {
     try { execFileSync('/bin/sh', ['-c', 'command -v "$1" >/dev/null', 'sh', prog], { stdio: 'ignore', env: { ...process.env, PATH: `${p('deploy')}:${process.env.PATH}` } }); return true; } catch { return false; }
   }
 
+  /**
+   * Conflicting PRs: rebase each one git can rebase cleanly, and return the repos that still need the engineer. Only where the PR
+   * has CI checks, which re-run on the rebased branch and gate review and merge as usual; with no CI, nothing would re-verify it.
+   */
+  async rebaseConflicts(n, state, conflicts) {
+    const still = [], done = [];
+    for (const name of conflicts) {
+      const r = this.repoByName(name), pr = state.prs?.[name];
+      if (!r || !pr || !(await T.hasActiveCi(r.repo))) { still.push(name); continue; }
+      const res = await R.autoRebase(n, r).catch((e) => ({ result: 'error', error: String(e.message).slice(0, 300) }));
+      M.record('auto_rebase', { repo: name, pr, ...res }, { actor: 'git', issue: n });
+      if (res.result !== 'rebased') { still.push(name); continue; }
+      state.heads = { ...(state.heads ?? {}), [name]: res.to };
+      state.awaitCi = { ...(state.awaitCi ?? {}), [name]: res.to }; // until checks show up on the new commit, CI is pending
+      done.push(`${name} (${res.from.slice(0, 7)} → ${res.to.slice(0, 7)})`);
+    }
+    if (done.length) {
+      M.saveIssueState(n, state);
+      await T.comment(this.repo, n, `### 🔀 Rebased onto the default branch automatically: ${done.join(', ')}\nAn earlier PR merged underneath. git rebased with no conflicts, so no build run was needed. CI re-runs on the rebased branch and gates review and merge as usual.`);
+    }
+    return still;
+  }
+
   repoByName(name) { return this.repos.find((r) => r.name === name) ?? (this.factory?.name === name ? this.factory : undefined); }
   prList(state) { return Object.entries(state.prs ?? {}).map(([name, pr]) => `${this.repoByName(name).repo}#${pr}`).join(', '); }
   // An environment passed with no_runtime_surface counts as done for promotion, without ever being marked deployed.
@@ -1438,7 +1470,9 @@ export class Dispatcher {
       const rows = [];
       for (const [name, pr] of Object.entries(state.prs ?? {})) {
         const r = this.repoByName(name);
-        for (const c of await T.prCheckList(r.repo, pr).catch(() => [])) rows.push({ repo: r.repo, name: c.name, bucket: c.bucket, link: c.link });
+        const list = await T.prCheckList(r.repo, pr).catch(() => []);
+        for (const c of list) rows.push({ repo: r.repo, name: c.name, bucket: c.bucket, link: c.link });
+        if (!list.length && state.awaitCi?.[name]) rows.push({ repo: r.repo, name: 'CI on the rebased commit', bucket: 'pending', link: null });
       }
       const table = rows.length ? `| Repo | Check | Result |\n|---|---|---|\n${rows.map((c) => `| ${c.repo} | ${c.name} | ${c.bucket} |`).join('\n')}` : '_No CI checks on the PR._';
       const failed = rows.filter((c) => c.bucket === 'fail' || c.bucket === 'cancel');

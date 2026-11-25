@@ -67,3 +67,30 @@ export async function commitsAhead(n, r) {
 
 // Push the worktree's HEAD to the issue branch, whatever the local branch is called, so work can never be stranded on a side branch.
 export const push = (n, r) => git(['push', '--force-with-lease', 'origin', `HEAD:refs/heads/${branch(n)}`], `${issueDir(n)}/${r.name}`);
+
+/**
+ * Rebase the issue branch onto the default branch when git can do it with no conflicts (rework review, 2026-11-25: a parent PR
+ * merging underneath sent #20, #3 and #5 back to a full build run just to rebase). Only from a clean worktree that holds exactly
+ * what the PR holds; the push is leased on that commit, so nothing anyone pushed meanwhile is overwritten. Anything else is left
+ * as it was for the engineer. Returns { result: 'rebased' | 'conflict' | 'dirty' | 'diverged' | 'missing', from, to }.
+ */
+export async function autoRebase(n, r) {
+  const wt = `${issueDir(n)}/${r.name}`, br = branch(n);
+  if (!existsSync(wt)) return { result: 'missing' };
+  if (await git(['status', '--porcelain'], wt)) return { result: 'dirty' };
+  await git(['fetch', '-q', 'origin', r.default_branch, br], wt);
+  const from = await git(['rev-parse', 'HEAD'], wt), remote = await git(['rev-parse', `origin/${br}`], wt).catch(() => '');
+  if (from !== remote) return { result: 'diverged', from };
+  try {
+    await git(['-c', `user.name=${studio()} factory`, '-c', 'user.email=factory@localhost', 'rebase', '-q', `origin/${r.default_branch}`], wt);
+  } catch {
+    await git(['rebase', '--abort'], wt).catch(() => {});
+    return { result: 'conflict', from };
+  }
+  const to = await git(['rev-parse', 'HEAD'], wt);
+  if (to !== from) {
+    try { await git(['push', '-q', `--force-with-lease=refs/heads/${br}:${from}`, 'origin', `HEAD:refs/heads/${br}`], wt); }
+    catch { await git(['reset', '-q', '--hard', from], wt); return { result: 'diverged', from }; } // someone pushed meanwhile
+  }
+  return { result: 'rebased', from, to };
+}

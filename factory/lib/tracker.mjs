@@ -157,6 +157,11 @@ export function errorTail(log, lines = 60) {
   const err = all.findLastIndex((l) => l.includes('##[error]'));
   return all.slice(0, err >= 0 ? err + 1 : all.length).slice(-lines).join('\n');
 }
+/** Whether the repo has at least one active Actions workflow (a disabled one, as on billing hold, runs nothing). */
+export async function hasActiveCi(repo) {
+  const { workflows = [] } = await json(['api', `repos/${repo}/actions/workflows`]).catch(() => ({}));
+  return workflows.some((w) => w.state === 'active');
+}
 export async function prMergeable(repo, pr) {
   const { mergeable } = await json(['pr', 'view', String(pr), '-R', repo, '--json', 'mergeable']);
   return mergeable; // MERGEABLE | CONFLICTING | UNKNOWN
