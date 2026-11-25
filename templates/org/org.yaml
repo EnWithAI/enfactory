@@ -134,7 +134,7 @@ tool_profiles:
   build: [ Read, Grep, Glob, Edit, Write, Bash, WebSearch, WebFetch ]
 
 roles:
-  cfo: { headcount: 1, model: claude-opus-5-5, tools: *read }
+  cfo: { headcount: 1, model: claude-sonnet-5-5, tools: *read }
   chief-of-staff: { headcount: 1, model: claude-opus-5-5, tools: *read }
   auditor: { headcount: 1, model: claude-opus-5-5, tools: *read }
   product-owner: { headcount: 1, model: claude-opus-5-5, tools: *read }
@@ -234,7 +234,7 @@ roles:
           "Edit(/{FACTORY}/memory/specs/*/verify.md)"
         ]
     }
-  account-executive: { headcount: 1, model: claude-opus-5-5, profile: read }
+  account-executive: { headcount: 1, model: claude-sonnet-5-5, profile: read }
   compliance-officer: { headcount: 1, model: claude-opus-5-5, profile: read }
 # aws: true (per role) = the agent runs with AWS_PROFILE=<aws.readonly_profile>. Every other agent has all AWS_* env stripped.
 
@@ -327,6 +327,7 @@ loops:
 # Second-person approval by risk tier: auto, or the role that approves (an agent, or the person holding it).
 gates:
   merge_by_risk: { low: auto, medium: auto, high: architect }
+  ci_wait_minutes: 15 # build, review and security wait this long for running PR checks; red checks send the issue back to build
 
 # Go-live policy, which the release-manager applies verbatim.
 release:
@@ -354,6 +355,10 @@ observability:
       "tail -n 40 ~/factory-envs/{name}/{env}/deploy.log",
       lsof -nP -iTCP -sTCP:LISTEN
     ]
+
+# The dashboard's port on this computer. `sf dashboard --port <n>` or SF_DASHBOARD_PORT overrides it for one start.
+dashboard:
+  port: 4340
 
 discovery:
   refresh_days: 7 # re-study repos that changed, keeping memory/product/ current
@@ -482,3 +487,32 @@ departments:
       - compliance
     mandate: Regulatory compliance (PCI DSS, PSD2/open banking, KYC/AML, GDPR), risk
       assessments and audit trails. Independent of engineering and security.
+# Economy: how much each kind of work may spend. The first `tasks` rule whose `task` is a prefix of the run label
+# (and `role`, if given) sets the model, effort and budget cap; roles keep their own model otherwise. A run that hits its cap
+# gets one "finish now" turn. resume_minutes: a role coming back to the same issue and stage continues its earlier session.
+# check_retries: machine-check failures are fixed in that same session. council_rounds: more rounds only while members disagree.
+# brief_kb: how much of earlier artifacts the brief carries inline, so agents don't spend steps reading them.
+economy:
+  resume_minutes: 60
+  check_retries: 2
+  council_rounds: 1
+  brief_kb: 40
+  tasks:
+    - { task: triage, model: claude-haiku-5-5, effort: low, budget_usd: 0.5 }
+    - { task: scope, model: claude-sonnet-5-5, effort: low, budget_usd: 0.75 }
+    - { task: approve-, model: claude-sonnet-5-5, effort: medium, budget_usd: 1.5 }
+    - { task: council-, model: claude-sonnet-5-5, effort: medium, budget_usd: 1 }
+    - { task: decide-questions, model: claude-sonnet-5-5, budget_usd: 1 }
+    - { task: engage-intake, model: claude-sonnet-5-5, budget_usd: 1 }
+    - { task: engage-requirements, model: claude-sonnet-5-5, budget_usd: 1 }
+    - { task: digest, model: claude-sonnet-5-5, budget_usd: 2 }
+    - { task: observe, effort: low, budget_usd: 0.5 }
+    - { task: analysis, budget_usd: 1 }
+    - { task: design, budget_usd: 2.5 }
+    - { task: feature-grooming, budget_usd: 3.5 }
+    - { task: tech-grooming, budget_usd: 3.5 }
+    - { task: build, budget_usd: 5 }
+    - { task: review, budget_usd: 3 }
+    - { task: security, budget_usd: 2 }
+    - { task: release, role: release-manager, budget_usd: 1 }
+    - { task: verify, budget_usd: 1.5 }

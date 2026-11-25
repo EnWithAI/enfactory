@@ -62,15 +62,45 @@ export function verdictSchema(nextOptions, extra = {}) {
 export { DECISION };
 
 /**
- * Run one agent headlessly. Resolves with { ok, out, cost, ms, session, error }.
- * Every run's full result is saved to memory/runs and summarised in the ledger.
+ * The economy rule for one run: the first `economy.tasks` entry whose `task` is a prefix of the run label (and whose `role`,
+ * if set, matches) picks the model, effort and budget cap. Roles keep their own model otherwise.
  */
-export function runAgent({ cfg, role, prompt, schema, cwd = HOME, issue = null, label = role, meta = {} }) {
+export function taskPolicy(cfg, role, label) {
+  const rule = (cfg.economy?.tasks ?? []).find((t) => String(label).startsWith(t.task) && (!t.role || t.role === role)) ?? {};
+  return {
+    model: rule.model ?? cfg.roles[role]?.model ?? 'claude-opus-5-5',
+    effort: rule.effort ?? cfg.roles[role]?.effort ?? null,
+    budget: rule.budget_usd ?? cfg.capacity?.budget_usd_per_run ?? 5,
+  };
+}
+
+const FINISH = 'You have reached the spending limit for this stage. Stop exploring. Using what you already know, hand in your result now ' +
+  'with the fewest further steps. If the work is genuinely not finished, say exactly what remains in the summary and handoff ' +
+  '(for a stage verdict, choose outcome `blocked`) rather than claiming it is done.';
+
+/**
+ * Run one agent headlessly. Resolves with { ok, out, cost, ms, session, error, usage }.
+ * Every run's full result is saved to memory/runs and summarised in the ledger (cost, tokens, steps).
+ * `resume` continues an earlier session of this role (its context is kept, so it doesn't re-read what it already knows).
+ * A run that hits its budget cap is continued once with a "finish now" turn instead of being thrown away.
+ */
+export async function runAgent(opts) {
+  const first = await runOnce(opts);
+  if (first.ok || !first.capped || !first.session || opts.noFinish) return first;
+  const pol = taskPolicy(opts.cfg, opts.role, opts.label ?? opts.role);
+  const fin = await runOnce({ ...opts, resume: first.session, prompt: FINISH, label: `${opts.label ?? opts.role}`, budget: Math.max(0.5, pol.budget / 2), meta: { ...opts.meta, finish: true } });
+  return { ...fin, cost: first.cost + fin.cost, ms: first.ms + fin.ms, finished_after_cap: true };
+}
+
+function runOnce({ cfg, role, prompt, schema, cwd = HOME, issue = null, label = role, meta = {}, resume = null, budget = null }) {
   const agentsFile = compileAgents(); // per run: newly hired roles are available immediately (immutable, content-addressed)
   const r = cfg.roles[role];
+  const pol = taskPolicy(cfg, role, label);
   const args = [
     '-p', '--agent', role, '--agents', agentsFile,
-    '--model', r.model ?? 'claude-opus-5-5',
+    ...(resume ? ['--resume', resume] : []),
+    '--model', pol.model,
+    ...(pol.effort ? ['--effort', pol.effort] : []),
     '--output-format', 'stream-json', '--verbose', // stream so the dashboard can show what the agent is doing
     '--json-schema', JSON.stringify(schema),
     '--permission-mode', 'dontAsk',
@@ -79,7 +109,8 @@ export function runAgent({ cfg, role, prompt, schema, cwd = HOME, issue = null, 
     // Read access to the project's local clone(s); write access still depends on the role's tools.
     ...(cfg.product?.repos ?? []).flatMap((r) => { const b = p('workspaces', r.repo.replace('/', '__')); return existsSync(b) ? ['--add-dir', b] : []; }),
     '--append-system-prompt', constitution() + lessons(role),
-    '--max-budget-usd', String(cfg.capacity?.budget_usd_per_run ?? 5),
+    '--exclude-dynamic-system-prompt-sections', // keeps the system prompt identical across runs, so the prompt cache is reused
+    '--max-budget-usd', String(budget ?? pol.budget),
     '--name', `sf:${label}${issue ? `#${issue}` : ''}`,
   ];
   // Least privilege: no agent inherits cloud credentials, except roles marked aws: true, which get the read-only profile.
@@ -111,13 +142,21 @@ export function runAgent({ cfg, role, prompt, schema, cwd = HOME, issue = null, 
       live.done();
       if (!res) try { res = JSON.parse(buf); } catch { /* fall through */ }
       const out = res?.structured_output ?? null;
+      // modelUsage is per model and stays accurate when a run ends on an error (where `usage` can read zero).
+      const mu = Object.values(res?.modelUsage ?? {}), u = res?.usage ?? {};
+      const sum = (k) => mu.reduce((s, m) => s + (m[k] ?? 0), 0);
+      const usage = mu.length
+        ? { cache_read: sum('cacheReadInputTokens'), cache_write: sum('cacheCreationInputTokens'), input: sum('inputTokens'), output: sum('outputTokens'), turns: res?.num_turns ?? 0 }
+        : { cache_read: u.cache_read_input_tokens ?? 0, cache_write: u.cache_creation_input_tokens ?? 0, input: u.input_tokens ?? 0, output: u.output_tokens ?? 0, turns: res?.num_turns ?? 0 };
+      const error = out ? null : (res?.result || res?.subtype || stderr || `exit ${code}`).slice(0, 2000);
       const result = {
         ok: !!out && !res?.is_error, out, cost: res?.total_cost_usd ?? 0, ms: Date.now() - started,
-        session: res?.session_id, error: out ? null : (res?.result || stderr || `exit ${code}`).slice(0, 2000),
-        denials: res?.permission_denials ?? [],
+        session: res?.session_id, error, usage, denials: res?.permission_denials ?? [],
+        capped: !out && /budget/i.test(`${res?.subtype ?? ''} ${error ?? ''}`),
       };
       saveRun(issue, label, { role, cwd, prompt, result: res, actions: live.all, stderr: stderr.slice(-4000) });
       record('run_finished', { role, label, ...meta, ok: result.ok, cost_usd: result.cost, ms: result.ms, session: result.session,
+        model: pol.model, effort: pol.effort, resumed: !!resume, capped: result.capped, ...usage,
         error: result.error, denials: result.denials.length }, { actor: role, issue });
       resolve(result);
     });

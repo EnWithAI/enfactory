@@ -40,7 +40,7 @@ export async function status() {
 }
 
 /** Create this install's org. Refuses to overwrite an existing one. */
-export async function apply({ company, mission, owner, budget }) {
+export async function apply({ company, mission, owner, budget, port }) {
   if (configured()) throw new Error('This factory is already set up (org/org.yaml exists).');
   company = String(company ?? '').trim(); owner = String(owner ?? '').trim().replace(/^@/, ''); budget = Number(budget);
   if (!company) throw new Error('Give your company a name.');
@@ -54,6 +54,7 @@ export async function apply({ company, mission, owner, budget }) {
   doc.setIn(['company', 'name'], company);
   if (String(mission ?? '').trim()) doc.setIn(['company', 'mission'], String(mission).trim());
   doc.setIn(['capacity', 'daily_budget_usd'], budget);
+  if (Number.isInteger(port)) doc.setIn(['dashboard', 'port'], port); // the dashboard comes back on the port it was set up on
   doc.setIn(['people'], doc.createNode([{ login: owner, roles: [], vendor: true, owner: true }]));
   mkdirSync(p('org'), { recursive: true });
   cpSync(p('templates/org/policies'), p('org/policies'), { recursive: true });

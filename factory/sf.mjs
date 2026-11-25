@@ -131,6 +131,7 @@ const commands = {
           sched.feedback = new Date().toISOString(); M.kv('scheduler', sched);
           import('./lib/hr.mjs').then((H) => H.review(loadConfig())).then((r) => r.resolved && console.log(`feedback: ${r.resolved} resolved`)).catch((e) => console.error('feedback:', e.message));
         }
+        import('./lib/digest.mjs').then((D) => D.ensure(loadConfig())).catch((e) => console.error('digest:', e.message)); // only when a source changed
         if (due('scan', 864e5)) { sched.scan = new Date().toISOString(); M.kv('scheduler', sched); d.scan().catch((e) => console.error('scan:', e.message)); }
         if (due('audit', cfg.audit.interval_days * 864e5)) { sched.audit = new Date().toISOString(); M.kv('scheduler', sched); d.audit().catch((e) => console.error('audit:', e.message)); }
       } catch (e) { console.error('tick:', e.message); M.record('error', { error: e.message }); }
@@ -232,7 +233,13 @@ const commands = {
   },
 
   async dashboard() {
-    (await import('./lib/dashboard.mjs')).serve(Number(flag('port', 4340)));
+    // Port: --port, then SF_DASHBOARD_PORT, then dashboard.port in org/org.yaml, then 4340 (the next free port if 4340 is taken).
+    const D = await import('./lib/dashboard.mjs');
+    const saved = (() => { try { return loadConfig().dashboard?.port; } catch { return undefined; } })();
+    const chosen = flag('port') ?? process.env.SF_DASHBOARD_PORT ?? saved;
+    const port = Number(chosen ?? D.DEFAULT_PORT);
+    if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error(`Not a usable port: ${chosen}. Use a number from 1024 to 65535.`);
+    D.serve(port, { explicit: (flag('port') ?? process.env.SF_DASHBOARD_PORT) != null }); // a saved port may fall through to the next free one
   },
 
   async report() {
@@ -326,7 +333,7 @@ const help = `sf: software factory
   Setup:    setup [--company "Name"] [--owner login] [--budget 50] (first run; the dashboard does this too) · init --tracker o/r --repo name=o/r [--repo …] · discover [--refresh | --answer] · answer [n "text" | --defaults | --delegate | --done]
   Org:      feedback [--file <role|org> complaint|request "text" | --review] · departments (org picks department heads) · library [--reindex] (org designs the documents library) · recruit (PO designs skills, CFO approves hires) · cfo-review · govern (council decides open proposals) · genesis [--teams a,b] · council "<topic>" [--members a,b] [--chair r]
   Run:      run · pause · resume · tick · observe · audit [--days 7]
-  Watch:    dashboard [--port 4340]  (live floor: who is working, what they're thinking, handoffs)
+  Watch:    dashboard [--port n]  (or SF_DASHBOARD_PORT, or dashboard.port in org.yaml; default 4340, next free port if taken)
   Work:     new "<title>" [--body ..] · approve <issue> · status · report [--days 7]
   Tools:    lint spec <n> · contrast "#fg" "#bg"  (WCAG ratio)
   Memory:   recall "<query>" · memory issue <n> | decisions | learnings`;

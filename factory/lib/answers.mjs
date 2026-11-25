@@ -23,8 +23,20 @@ export function record({ n, title, text, by = 'owner', at = new Date().toISOStri
     }
   }
   if (stale.length) writeFileSync(FILE, lines.join('\n'));
+  current();
   M.record('answer_recorded', { request: n, title: title.slice(0, 160), text: text.trim().slice(0, 600), stale_lines: stale }, { actor: by });
   return stale;
+}
+
+/**
+ * answers.md without the assumptions people have since overridden (lines marked STALE). Agents read this one: the full
+ * file is the audit trail, and its stale lines cost every reader tokens and invite the wrong answer.
+ */
+export function current() {
+  const src = existsSync(FILE) ? readFileSync(FILE, 'utf8') : '';
+  const out = src.split('\n').filter((l) => !l.includes('[STALE')).join('\n').replace(/\n{3,}/g, '\n\n');
+  writeFileSync(p('memory/product/answers.current.md'), `<!-- Generated from answers.md without superseded (STALE) lines. Edit answers.md, not this file. -->\n${out}`);
+  return out;
 }
 
 /** The latest owner answers, newest first, for stage prompts and checks. */

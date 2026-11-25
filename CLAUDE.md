@@ -23,10 +23,10 @@ Memory lives under `memory/` in the factory repo and is shared by every agent:
 - `memory/threads/`: council and genesis discussions.
 
 Before acting:
-0. Read `memory/product/overview.md` and the doc for every repo you will touch.
-1. `sf recall "<keywords>"` searches all memory. Check prior decisions and learnings that touch your work.
-2. `sf memory issue <n>` shows everything recorded about this issue so far.
-3. Read the earlier stage artifacts in `memory/specs/issue-<n>/`.
+- Your brief already carries your team's digest, the product brief, the current owner answers, the issue's comments and history,
+  and the earlier stage artifacts. Don't re-read them. Every extra step re-reads your whole conversation, so it costs the org money.
+- For anything the brief doesn't cover: the doc for each repo you will touch (`memory/product/repos/<name>.md`), `sf recall "<keywords>"`
+  for prior decisions and learnings, and the full documents the brief lists. Read only what fills a specific gap.
 
 When acting:
 - Put every non-trivial choice in `decisions` in your verdict (title, decision, rationale, alternatives).

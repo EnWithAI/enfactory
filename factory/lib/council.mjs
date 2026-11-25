@@ -24,13 +24,17 @@ export async function council({ cfg, name, topic, context, chair, members, round
   record('council_opened', { name, topic, chair, members }, { issue });
   for (let round = 1; round <= rounds; round++) {
     const results = await Promise.all(members.map((role) => runAgent({
-      cfg, role, cwd, issue, label: `council-${role}`, schema: POSITION,
+      cfg, role, cwd, issue, label: `council-${role}`, schema: nextOptions ? { ...POSITION, properties: { ...POSITION.properties, recommended_next: { enum: nextOptions } } } : POSITION,
       prompt: `# Council: ${topic}\nYou are the ${role} on this council. Chair: ${chair}.\n\n## Context\n${context}\n\n` +
         (transcript.length ? `## Discussion so far\n${render()}\n\nThis is round ${round}. Respond to the others. Converge where you can, and hold firm where your domain requires it.\n`
           : 'This is round 1. Give your independent position from your domain.\n') +
         (nextOptions ? `\nThe routes the council can choose: ${nextOptions.join(', ')}.\n` : ''),
     })));
     results.forEach((r, i) => transcript.push({ round, role: members[i], ...(r.out ?? { position: `(no response: ${r.error})`, proposal: '', concerns: [] }) }));
+    // Another round only while members disagree on the route; once they agree, more rounds just restate it.
+    const routes = new Set(transcript.filter((t) => t.round === round).map((t) => String(t.recommended_next ?? '').trim().toLowerCase()));
+    const agreed = routes.size === 1 ? [...routes][0] : '';
+    if (nextOptions && agreed && round < rounds) { record('council_converged', { name, round, route: agreed }, { issue }); break; }
   }
 
   const decision = await runAgent({

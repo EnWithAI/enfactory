@@ -49,13 +49,23 @@ export function learn(text, { actor, issue = null } = {}) {
 }
 
 /** Save a stage artifact. An existing version is kept as <stage>.v<N>.md, so a later run never destroys earlier work. */
+const lastVersion = (issue, stage) => {
+  let v = 1;
+  while (existsSync(p('memory/specs', `issue-${issue}`, `${stage}.v${v}.md`))) v++;
+  return v - 1; // 0 = none
+};
+/** Keep the current artifact as a numbered version, unless that exact text is already the latest version. */
+export function snapshotArtifact(issue, stage) {
+  const file = p('memory/specs', `issue-${issue}`, `${stage}.md`);
+  if (!existsSync(file)) return;
+  const v = lastVersion(issue, stage), cur = readFileSync(file, 'utf8');
+  if (v && readFileSync(p('memory/specs', `issue-${issue}`, `${stage}.v${v}.md`), 'utf8') === cur) return;
+  writeFileSync(p('memory/specs', `issue-${issue}`, `${stage}.v${v + 1}.md`), cur);
+}
+/** Save a stage's artifact. The previous text is kept as a version first (agents may also write the file during their run). */
 export function saveArtifact(issue, stage, markdown) {
   const file = p('memory/specs', `issue-${issue}`, `${stage}.md`);
-  if (existsSync(file)) {
-    let v = 1;
-    while (existsSync(p('memory/specs', `issue-${issue}`, `${stage}.v${v}.md`))) v++;
-    renameSync(file, p('memory/specs', `issue-${issue}`, `${stage}.v${v}.md`));
-  }
+  if (existsSync(file) && readFileSync(file, 'utf8') !== markdown) snapshotArtifact(issue, stage);
   return path.relative(p(), write(file, markdown));
 }
 

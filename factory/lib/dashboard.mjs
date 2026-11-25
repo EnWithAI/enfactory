@@ -11,6 +11,7 @@ import { runAgent } from './worker.mjs';
 import { createIssue, gh, humanComment, editLabels, closeIssue, MARK } from './tracker.mjs';
 import { tree as libraryTree } from './library.mjs';
 
+export const DEFAULT_PORT = 4340;
 const list = (dir, ext = '.md') => (existsSync(p(dir)) ? readdirSync(p(dir)).filter((f) => f.endsWith(ext)).sort() : []);
 
 function adrs(limit = 60) {
@@ -67,6 +68,45 @@ function docs() {
     });
   }
   return out;
+}
+
+// ── spend: where the org's money and tokens go, and whether the economy rules are working ──
+const taskOf = (label) => String(label ?? '').replace(/-[0-9a-f]{8}$/, '').replace(/-\d+$/, '').replace(/#\d+$/, '');
+function spend(evs) {
+  const runs = evs.filter((e) => e.type === 'run_finished');
+  const since = (ms) => runs.filter((e) => Date.now() - new Date(e.ts) < ms);
+  const switched = evs.find((e) => e.type === 'economy_enabled')?.ts ?? null;
+  const tokens = (e) => (e.cache_read ?? 0) + (e.cache_write ?? 0) + (e.input ?? 0) + (e.output ?? 0);
+  const group = (list, key) => {
+    const g = {};
+    for (const e of list) {
+      const k = key(e), x = (g[k] ??= { key: k, runs: 0, cost: 0, tokens: 0, turns: 0, measured: 0, capped: 0, resumed: 0 });
+      x.runs++; x.cost += e.cost_usd ?? 0; x.capped += e.capped ? 1 : 0; x.resumed += e.resumed ? 1 : 0;
+      if (e.turns != null) { x.measured++; x.tokens += tokens(e); x.turns += e.turns; }
+    }
+    return Object.values(g).map((x) => ({ ...x, avgCost: x.cost / x.runs, avgTurns: x.measured ? x.turns / x.measured : null, avgTokens: x.measured ? x.tokens / x.measured : null }))
+      .sort((a, b) => b.cost - a.cost);
+  };
+  // Rework: every run after the first of the same role on the same issue and task, plus councils and check retries.
+  const seen = new Set();
+  let rework = 0;
+  for (const e of runs) {
+    const k = `${e.actor}|${e.issue}|${taskOf(e.label)}`;
+    if (e.issue && (seen.has(k) || /^council-/.test(e.label) || e.check_retry)) rework += e.cost_usd ?? 0;
+    seen.add(k);
+  }
+  const window = (list) => ({ runs: list.length, cost: list.reduce((s, e) => s + (e.cost_usd ?? 0), 0) });
+  // Before and after the economy rules, per task: the fair comparison is the average cost of the same kind of run.
+  const compare = switched ? (() => {
+    const before = group(runs.filter((e) => e.ts < switched), (e) => taskOf(e.label)), after = group(runs.filter((e) => e.ts >= switched), (e) => taskOf(e.label));
+    return after.map((a) => ({ task: a.key, after: a.avgCost, afterRuns: a.runs, before: before.find((b) => b.key === a.key)?.avgCost ?? null }))
+      .filter((r) => r.before != null).sort((a, b) => b.afterRuns - a.afterRuns).slice(0, 12);
+  })() : [];
+  return {
+    today: window(since(864e5)), week: window(since(7 * 864e5)), all: window(runs), rework,
+    byRole: group(runs, (e) => e.actor).slice(0, 20), byTask: group(runs, (e) => taskOf(e.label)).slice(0, 20),
+    switched, compare,
+  };
 }
 
 function state() {
@@ -134,7 +174,7 @@ function state() {
     company: cfg.company?.name, product: cfg.product.name, tracker: cfg.product.tracker, repos: cfg.product.repos.map((r) => r.repo),
     build: statSync(new URL('./dashboard.html', import.meta.url)).mtimeMs,
     delivery: cfg.delivery ?? null, release: existsSync(p('memory/state/release.json')) ? JSON.parse(readFileSync(p('memory/state/release.json'), 'utf8')) : null, departments: cfg.departments ?? {}, stages: Object.keys(cfg.pipeline), stageRoles: Object.fromEntries(Object.entries(cfg.pipeline).map(([k, v]) => [k, v.role ?? v.council?.chair ?? 'dispatcher'])), handoffs, people: cfg.people ?? [], teams, running, issues: Object.values(issues), feed,
-    decisions: adrs(), docs: docs(), library: (() => { try { return libraryTree(); } catch { return []; } })(), generations: existsSync(p('memory/state/generations.json')) ? JSON.parse(readFileSync(p('memory/state/generations.json'), 'utf8')) : {},
+    spend: spend(evs), decisions: adrs(), docs: docs(), library: (() => { try { return libraryTree(); } catch { return []; } })(), generations: existsSync(p('memory/state/generations.json')) ? JSON.parse(readFileSync(p('memory/state/generations.json'), 'utf8')) : {},
     hiredRoles: [...new Set(evs.filter((e) => e.type === 'hired' && e.team).map((e) => e.role))],
     stats: {
       costToday: runs.filter((e) => e.ts >= today).reduce((s, e) => s + (e.cost_usd ?? 0), 0),
@@ -321,10 +361,14 @@ function startDispatcher() {
 
 const body = (req) => new Promise((resolve) => { let b = ''; req.on('data', (d) => { b += d; if (b.length > 1e5) req.destroy(); }); req.on('end', () => resolve(b)); });
 
-export function serve(port = 4340) {
+/**
+ * Serve the dashboard. A port the person chose is used or refused; the default port falls through to the next free one,
+ * so a fresh install never fails because something else already uses 4340.
+ */
+export function serve(port = DEFAULT_PORT, { explicit = false } = {}) {
   // Paid agent runs and GitHub actions: accept only JSON requests from this dashboard itself, on any of its local addresses.
-  const local = new RegExp(`^http://(127\\.0\\.0\\.1|localhost|\\[::1\\]):${port}$`);
-  const trusted = (req) => req.headers['x-factory-ask'] === '1' && String(req.headers['content-type']).startsWith('application/json') && (!req.headers.origin || local.test(req.headers.origin));
+  const local = () => new RegExp(`^http://(127\\.0\\.0\\.1|localhost|\\[::1\\]):${port}$`); // port is final once bound
+  const trusted = (req) => req.headers['x-factory-ask'] === '1' && String(req.headers['content-type']).startsWith('application/json') && (!req.headers.origin || local().test(req.headers.origin));
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://x');
     const json = (o, code = 200) => { res.statusCode = code; res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(o)); };
@@ -333,7 +377,7 @@ export function serve(port = 4340) {
       if (url.pathname === '/api/setup' && req.method === 'GET') return json(await (await import('./setup.mjs')).status());
       if (url.pathname === '/api/setup' && req.method === 'POST') {
         if (!trusted(req)) return json({ error: 'Refused: setup can only be done from this dashboard.' }, 403);
-        return body(req).then(async (b) => json(await (await import('./setup.mjs')).apply(JSON.parse(b || '{}'))))
+        return body(req).then(async (b) => json(await (await import('./setup.mjs')).apply({ ...JSON.parse(b || '{}'), port })))
           .catch((e) => json({ error: e.message }, 400));
       }
       if (url.pathname.startsWith('/api/') && !configured()) return json({ error: 'not set up', setup: true }, 409);
@@ -406,8 +450,24 @@ export function serve(port = 4340) {
     } catch (e) { res.statusCode = 500; res.end(String(e.message)); }
   });
   // Refuse to share a port with another service (e.g. a Docker container bound to *:port would shadow us).
-  const probe = http.createServer().once('error', () => {
-    console.error(`Port ${port} is already used by another service. Pick a free one: sf dashboard --port <n>`); process.exit(1);
-  }).once('listening', () => probe.close(() => server.listen(port, '127.0.0.1', () => console.log(`Dashboard: http://127.0.0.1:${port}`))));
-  probe.listen(port); // binding all interfaces detects wildcard listeners that a 127.0.0.1-only bind would not
+  const first = port;
+  const busy = () => {
+    if (!explicit && port < first + 20) { port++; return tryPort(); }
+    console.error(explicit ? `Port ${port} is already used by another service. Pick a free one: sf dashboard --port <n>`
+      : `Ports ${first}-${port} are all in use. Pick a free one: sf dashboard --port <n>`);
+    process.exit(1);
+  };
+  // Both binds must succeed: all interfaces catches wildcard listeners (a Docker container on *:port), 127.0.0.1 catches loopback-only ones.
+  const tryPort = () => {
+    const probe = http.createServer().once('error', busy).once('listening', () => probe.close(() => {
+      server.once('error', busy);
+      server.listen(port, '127.0.0.1');
+    }));
+    probe.listen(port);
+  };
+  server.once('listening', () => {
+    server.removeListener('error', busy);
+    console.log(`Dashboard: http://127.0.0.1:${port}${port !== first ? ` (port ${first} was busy)` : ''}`);
+  });
+  tryPort();
 }

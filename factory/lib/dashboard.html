@@ -385,6 +385,15 @@ dialog::backdrop { background: var(--scrim); }
 .md pre code { background: none; padding: 0; }
 .md table { display: block; overflow-x: auto; }
 .md blockquote { margin: 0; padding-left: 14px; border-left: 3px solid var(--border-strong); color: var(--fg-2); }
+/* spend */
+.spend-kpis { display: flex; flex-wrap: wrap; gap: 10px 28px; margin: 4px 0 12px; }
+.spend-kpis div { display: flex; flex-direction: column; }
+.spend-kpis b { font-size: 20px; font-variant-numeric: tabular-nums; }
+.spend-kpis span { font-size: 12px; color: var(--fg-3); }
+.spend-body { overflow-x: auto; max-height: 420px; }
+.spend-body td.n, .spend-body th.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.spend-body .bar { display: inline-block; height: 6px; border-radius: 3px; background: var(--fg-3); opacity: .5; vertical-align: middle; margin-left: 8px; }
+.spend-body .down { color: var(--ok); } .spend-body .up { color: var(--err); }
 /* first-run setup */
 #setupbox { width: min(760px, 100vw - 32px); }
 .setwrap { padding: 16px 24px 24px; display: flex; flex-direction: column; gap: 18px; }
@@ -455,6 +464,13 @@ dialog::backdrop { background: var(--scrim); }
   <section class="panel">
     <h2>Library <small class="muted">documents filed by the agents, in the folders the organisation decided</small></h2>
     <div class="lib" id="library"></div>
+  </section>
+
+  <section class="panel spend" aria-labelledby="spend-title">
+    <h2 id="spend-title">Spend <small class="muted">where the money and tokens go, and whether the economy rules are working</small></h2>
+    <div class="spend-kpis" id="spend-kpis"></div>
+    <div class="tabs" role="tablist" aria-label="Spend views" id="spend-tabs"></div>
+    <div class="spend-body" id="spend-body" role="tabpanel"></div>
   </section>
 
   <section class="panel records">
@@ -1205,6 +1221,46 @@ function renderRecords(s) {
     rows.length > recLimit ? el('button', { class: 'more', type: 'button', onclick: () => { recLimit += 25; recSig = ''; renderRecords(lastState); } }, `Show more (${rows.length - recLimit} left)`) : null);
 }
 
+// ── spend: money and tokens by role and task, rework, and before/after the economy rules ──
+const SPEND_TABS = [['role', 'By role'], ['task', 'By task'], ['compare', 'Before / after']];
+let spendTab = (() => { try { return localStorage.getItem('spendTab') || 'role'; } catch { return 'role'; } })(), spendSig = '';
+const usd = (n) => `$${(n ?? 0).toFixed(2)}`;
+const kTok = (n) => (n == null ? '–' : n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : `${Math.round(n / 1e3)}k`);
+function renderSpend(s) {
+  const sp = s.spend;
+  if (!sp) return;
+  const sig = `${spendTab}|${sp.all.runs}|${sp.all.cost.toFixed(2)}`;
+  if (sig === spendSig) return;
+  spendSig = sig;
+  $('spend-kpis').replaceChildren(
+    ...[[usd(sp.today.cost), `today · ${sp.today.runs} runs`], [usd(sp.week.cost), `last 7 days · ${sp.week.runs} runs`], [usd(sp.all.cost), `all time · ${sp.all.runs} runs`],
+      [usd(sp.all.runs ? sp.all.cost / sp.all.runs : 0), 'average per run'],
+      [`${usd(sp.rework)} (${sp.all.cost ? Math.round((100 * sp.rework) / sp.all.cost) : 0}%)`, 'rework: repeat runs, councils, check retries']]
+      .map(([b, t]) => el('div', {}, el('b', {}, b), el('span', {}, t))));
+  const tabs = SPEND_TABS.filter(([k]) => k !== 'compare' || sp.switched);
+  if (!tabs.some(([k]) => k === spendTab)) spendTab = 'role';
+  $('spend-tabs').replaceChildren(...tabs.map(([k, label]) => el('button', { type: 'button', role: 'tab', id: `stab-${k}`, 'aria-selected': String(k === spendTab), tabindex: k === spendTab ? '0' : '-1',
+    onclick: () => { spendTab = k; spendSig = ''; try { localStorage.setItem('spendTab', k); } catch {} renderSpend(lastState); $(`stab-${k}`).focus(); } }, label)));
+  const num = (v, cls = 'n') => el('td', { class: cls }, v);
+  if (spendTab === 'compare') {
+    $('spend-body').replaceChildren(el('p', { class: 'muted', style: 'margin:0 0 8px' }, `Average cost of the same kind of run, before and after the economy rules started (${new Date(sp.switched).toLocaleString()}).`),
+      sp.compare.length ? el('table', {}, el('thead', {}, el('tr', {}, el('th', {}, 'Task'), el('th', { class: 'n' }, 'Before'), el('th', { class: 'n' }, 'After'), el('th', { class: 'n' }, 'Change'), el('th', { class: 'n' }, 'Runs since'))),
+        el('tbody', {}, ...sp.compare.map((r) => { const ch = (r.after - r.before) / r.before;
+          return el('tr', {}, el('td', {}, r.task), num(usd(r.before)), num(usd(r.after)), el('td', { class: `n ${ch <= 0 ? 'down' : 'up'}` }, `${ch <= 0 ? '−' : '+'}${Math.abs(Math.round(ch * 100))}%`), num(String(r.afterRuns))); })))
+        : el('p', { class: 'muted' }, 'No runs since the economy rules started. The comparison fills in as the org works.'));
+    return;
+  }
+  const rows = spendTab === 'role' ? sp.byRole : sp.byTask, max = Math.max(...rows.map((r) => r.cost), 0.01);
+  $('spend-body').replaceChildren(el('table', {},
+    el('thead', {}, el('tr', {}, el('th', {}, spendTab === 'role' ? 'Role' : 'Task'), el('th', { class: 'n' }, 'Cost'), el('th', { class: 'n' }, 'Runs'), el('th', { class: 'n' }, 'Per run'),
+      el('th', { class: 'n', title: 'Steps per run (each step re-reads the conversation so far)' }, 'Steps/run'), el('th', { class: 'n', title: 'Tokens processed per run, cached and uncached' }, 'Tokens/run'),
+      el('th', { class: 'n', title: 'Runs that continued an earlier session / runs that hit their budget cap' }, 'Resumed · capped'))),
+    el('tbody', {}, ...rows.map((r) => el('tr', {},
+      el('td', {}, r.key || '—'), el('td', { class: 'n' }, usd(r.cost), el('span', { class: 'bar', style: `width:${Math.round(60 * r.cost / max)}px`, 'aria-hidden': 'true' })),
+      num(String(r.runs)), num(usd(r.avgCost)), num(r.avgTurns == null ? '–' : r.avgTurns.toFixed(0)), num(kTok(r.avgTokens)), num(`${r.resumed} · ${r.capped}`))))),
+    el('p', { class: 'muted', style: 'margin:8px 0 0;font-size:12px' }, 'Steps and tokens are recorded for runs from the economy update on; older runs show cost only.'));
+}
+
 // ── first run: set up the factory from here, no terminal needed ──
 const postJSON = async (url, body) => {
   const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-factory-ask': '1' }, body: JSON.stringify(body ?? {}) });
@@ -1287,7 +1343,7 @@ async function refresh() {
   if (window.BUILD && s.build && s.build !== window.BUILD && !document.querySelector('dialog[open]')) return location.reload(); // new dashboard code
   window.BUILD ??= s.build;
   lastState = s; GENS = s.generations ?? {};
-  renderRelease(s); renderFloor(s); renderFlow(s); flyHandoffs(s); renderFeed(s); renderBoard(s); renderLibrary(s); renderRecords(s); refreshTip();
+  renderRelease(s); renderFloor(s); renderFlow(s); flyHandoffs(s); renderFeed(s); renderBoard(s); renderLibrary(s); renderSpend(s); renderRecords(s); refreshTip();
   if (ASKS.some((a) => a.status === 'running')) renderAsks();
   firstLoad = false;
 }

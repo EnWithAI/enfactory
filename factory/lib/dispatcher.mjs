@@ -241,12 +241,40 @@ export class Dispatcher {
     const state = M.issueState(n);
     const cwd = st.workspace ? await R.worktrees(n, this.touched(state)) : HOME;
     const schema = verdictSchema(st.next, this.extra(stage));
+    issue.comments ??= await T.viewIssue(this.repo, n).then((i) => i.comments).catch(() => []); // people's words go in the brief
+    M.snapshotArtifact(n, stage); // the agent may rewrite its artifact file during the run; keep the version it starts from
+    if (['review', 'security'].includes(stage) && Object.keys(state.prs ?? {}).length) issue.ci = await this.ciGate(state, 0).catch(() => null); // owner request #50
     const context = this.context(issue, stage, state, cwd);
 
-    const res = st.council
-      ? await council({ cfg, name: `issue-${n}/${stage}-${Date.now()}`, topic: `#${n} ${issue.title}`, context, issue: n, cwd,
-          chair: st.council.chair, members: st.council.members, rounds: st.council.rounds ?? 2, nextOptions: st.next, extraSchema: this.extra(stage) })
-      : await runAgent({ cfg, role: this.pickRole(stage, st, state), prompt: context, schema, cwd, issue: n, label: stage, meta: { stage, risk: state.risk ?? null, loops: state.loops } });
+    let res;
+    if (st.council) {
+      res = await council({ cfg, name: `issue-${n}/${stage}-${Date.now()}`, topic: `#${n} ${issue.title}`, context, issue: n, cwd,
+        chair: st.council.chair, members: st.council.members, rounds: st.council.rounds ?? cfg.economy?.council_rounds ?? 2, nextOptions: st.next, extraSchema: this.extra(stage) });
+    } else {
+      const role = this.pickRole(stage, st, state);
+      const meta = { stage, risk: state.risk ?? null, loops: state.loops };
+      // The same role coming back to this issue and stage soon after (a loop-back, a failed check) continues its own session:
+      // it already holds the brief and what it read, so it gets only what changed.
+      const prev = state.sessions?.[`${role}:${stage}`];
+      const fresh = prev && prev.cwd === cwd && Date.now() - new Date(prev.at) < (cfg.economy?.resume_minutes ?? 0) * 60e3;
+      res = fresh ? await runAgent({ cfg, role, schema, cwd, issue: n, label: stage, meta, resume: prev.session, prompt: this.delta(issue, stage, state, prev.at) }) : null;
+      if (!res?.ok) res = await runAgent({ cfg, role, prompt: context, schema, cwd, issue: n, label: stage, meta });
+      // Machine checks fail fast in the same session: the agent fixes its own artifact instead of a fresh run next tick.
+      for (let i = 0; res.ok && st.checks?.length && res.out.outcome === 'advance' && i < (cfg.economy?.check_retries ?? 0); i++) {
+        const { runChecks } = await import('./checks.mjs');
+        const c = runChecks(st.checks, this.artifactOf(n, stage, res), cfg);
+        if (c.ok || !res.session) break;
+        M.record('check_retry', { stage, attempt: i + 1, failures: c.failures.slice(0, 20) }, { actor: role, issue: n });
+        const again = await runAgent({ cfg, role, schema, cwd, issue: n, label: stage, meta: { ...meta, check_retry: i + 1 }, resume: res.session,
+          prompt: `Your ${stage} artifact failed ${st.checks.join(', ')}. Fix every item below, re-run the check, and hand in the corrected verdict with the full artifact:\n${c.failures.map((f) => `- ${f}`).join('\n')}` });
+        if (!again.ok) break;
+        res = { ...again, cost: res.cost + again.cost };
+      }
+      if (res.ok && res.session) {
+        state.sessions = { ...(state.sessions ?? {}), [`${role}:${stage}`]: { session: res.session, at: now().toISOString(), cwd } };
+        M.saveIssueState(n, state);
+      }
+    }
 
     if (!res.ok && INFRA.test(String(res.error))) {
       M.record('infra_failure', { stage, error: String(res.error).slice(0, 300) }, { issue: n }); // retried next tick; not the agent's fault
@@ -282,8 +310,8 @@ export class Dispatcher {
       const members = [...new Set([role, target.role ?? target.council?.chair, 'product-manager'].filter(Boolean))];
       const c = await council({
         cfg, name: `issue-${n}/loop-${stage}-to-${next}-${Date.now()}`, topic: `#${n} keeps looping (${stage} → ${next}). What is the right route?`,
-        context: `${this.context(issue, stage, state, cwd)}\n\n## The ${role}'s verdict that triggered this council\n${v.summary}\n\n${v.handoff}\n\nThis issue has looped ${state.loops} time(s): ${JSON.stringify(state.history.slice(-6))}`,
-        chair: state.loops + 1 > cfg.loops.max_loops ? 'chief-of-staff' : 'architect', members, rounds: 2, nextOptions: st.next, issue: n, cwd, extraSchema: this.extra(stage),
+        context: `${this.context(issue, stage, state, cwd, { kb: 12, reviewing: true })}\n\n## The ${role}'s verdict that triggered this council\n${v.summary}\n\n${v.handoff}\n\nThis issue has looped ${state.loops} time(s): ${JSON.stringify(state.history.slice(-6))}`,
+        chair: state.loops + 1 > cfg.loops.max_loops ? 'chief-of-staff' : 'architect', members, rounds: cfg.economy?.council_rounds ?? 2, nextOptions: st.next, issue: n, cwd, extraSchema: this.extra(stage),
       });
       if (c.ok) {
         await T.comment(repo, n, `🗣️ **Council convened** on repeated loop-backs. The transcript is at \`${c.thread}\`.`);
@@ -293,11 +321,7 @@ export class Dispatcher {
 
     // An agent allowed to write its own artifact may have written the full document and returned only a summary:
     // the file it wrote during this run is the artifact, so it is never overwritten by the summary.
-    const own = p('memory/specs', `issue-${n}`, `${stage}.md`);
-    if (existsSync(own) && statSync(own).mtimeMs >= Date.now() - (res.ms ?? 0) - 2000) {
-      const written = readFileSync(own, 'utf8');
-      if (written.length > 2 * (v.artifact_markdown?.length ?? 0)) v.artifact_markdown = written;
-    }
+    v.artifact_markdown = this.artifactOf(n, stage, res);
     const artifact = M.saveArtifact(n, stage, v.artifact_markdown);
     const adrs = (v.decisions ?? []).map((d) => M.decide(d, { actor: role, issue: n }));
     for (const l of v.learnings ?? []) M.learn(l, { actor: role, issue: n });
@@ -356,6 +380,23 @@ export class Dispatcher {
         await T.prComment(this.repoByName(name).repo, pr, `### ${role}: ${next === 'merge' || next === 'security' ? '✅' : '❌'}\n${v.summary}`);
       }
     }
+    // CI gate (owner request #50): build, review and security may not advance while the PR's checks are red. Waits for
+    // pending checks, then loops to build with the failing log, so CI failures are fixed before review instead of at merge.
+    const FORWARD = { build: 'review', review: 'security', security: 'merge' };
+    if (FORWARD[stage] === next && Object.keys(state.prs ?? {}).length) {
+      const ci = await this.ciGate(state);
+      if (ci.status === 'fail') {
+        isLoop || (state.loops += 1);
+        state.lastHandoff = { from: `ci:${stage}`, by: 'ci', text: `CI is red on the PR, so \`${stage}\` can't advance. Fix these failures on the branch, run the same checks locally, and commit:\n\n${ci.failures.map((f) => `### ${f.repo}: ${f.name}\n\`\`\`\n${f.log || '(no log available; see the check link)'}\n\`\`\`\n${f.link ?? ''}`).join('\n\n')}` };
+        state.history.push({ ts: now().toISOString(), stage, to: 'build', outcome: 'loop_back', by: 'ci' });
+        M.saveIssueState(n, state);
+        M.record('transition', { stage, to: 'build', outcome: 'loop_back', loop: stage !== 'build', loops: state.loops, kind: 'ci_failure', summary: `CI failed: ${ci.failures.map((f) => `${f.repo}/${f.name}`).join(', ')}` }, { actor: 'ci', issue: n });
+        await T.comment(repo, n, `### 🔁 CI is red, so \`${stage}\` can't advance: back to \`build\`\n${ci.table}\n\n<details><summary>Failing log excerpts</summary>\n\n${ci.failures.map((f) => `**${f.repo}: ${f.name}**\n\`\`\`\n${(f.log || '').slice(-3000)}\n\`\`\``).join('\n\n')}\n</details>`);
+        if (state.loops > cfg.loops.max_loops) return this.escalate(n, state, 'build', 'CI keeps failing.');
+        return this.move(issue, stage, 'build', state);
+      }
+      if (ci.status === 'timeout') M.record('ci_wait_timeout', { stage, table: ci.table.slice(0, 1000) }, { issue: n }); // merge still enforces green
+    }
     if (stage === 'release') {
       if (v.deploy_now) {
         const env = v.environment ?? this.nextEnv(state);
@@ -399,7 +440,7 @@ export class Dispatcher {
       state.consults = (state.consults ?? 0) + 1;
       const c = await runAgent({ cfg, role: v.consult.role, issue: n, label: `consult-${stage}`, cwd,
         schema: { type: 'object', properties: { answer: { type: 'string' }, decisions: { type: 'array', items: { type: 'object' } } }, required: ['answer'] },
-        prompt: `${this.context(issue, stage, state, cwd)}\n\n# Consult\nThe ${role} working on \`${stage}\` asks you, as ${v.consult.role}:\n> ${v.consult.question}\n\nAnswer within your authority, precisely. Record any decision you make.` });
+        prompt: `${this.context(issue, stage, state, cwd, { kb: 12, reviewing: true })}\n\n# Consult\nThe ${role} working on \`${stage}\` asks you, as ${v.consult.role}:\n> ${v.consult.question}\n\nAnswer within your authority, precisely. Record any decision you make.` });
       if (c.ok) {
         for (const d of c.out.decisions ?? []) if (d.title && d.decision) M.decide({ rationale: '', ...d }, { actor: v.consult.role, issue: n });
         state.lastHandoff = { from: `consult:${v.consult.role}`, by: v.consult.role, text: `Answer to the ${role}'s question "${v.consult.question}":\n${c.out.answer}` };
@@ -415,7 +456,7 @@ export class Dispatcher {
         const lead = cfg.teams[teamOf(cfg, role)]?.lead;
         const head = Object.values(cfg.departments ?? {}).find((d) => d.teams?.includes(teamOf(cfg, role)))?.head; // first escalation point
         const c = await council({ cfg, name: `issue-${n}/blocked-${stage}-${Date.now()}`, topic: `#${n}: the ${role} is blocked in ${stage}. Decide.`,
-          context: `${this.context(issue, stage, state, cwd)}\n\n## What blocked the ${role}\n${v.summary}\n\n${v.question_for_human ?? ''}\n${v.handoff}`,
+          context: `${this.context(issue, stage, state, cwd, { kb: 12, reviewing: true })}\n\n## What blocked the ${role}\n${v.summary}\n\n${v.question_for_human ?? ''}\n${v.handoff}`,
           chair: 'chief-of-staff', members: [...new Set([role, lead, head, 'product-owner'].filter(Boolean))], rounds: 2, nextOptions: st.next, issue: n, cwd, extraSchema: this.extra(stage) });
         if (c.ok) return this.apply(issue, stage, c, state, cwd, { fromCouncil: true });
       }
@@ -578,7 +619,7 @@ export class Dispatcher {
     const res = await runAgent({ cfg: this.cfg, role, issue: n, label: `approve-${stage}`, cwd: HOME,
       schema: { type: 'object', properties: { approved: { type: 'boolean' }, route_to: { enum: back }, summary: { type: 'string' }, handoff: { type: 'string' },
         decisions: { type: 'array', items: { type: 'object' } } }, required: ['approved', 'summary', 'handoff'] },
-      prompt: `${this.context(issue, stage, state, HOME)}\n\n# Approval\nYou are the approver (${role}) for ${what}. Hold it to your charter's bar. ` +
+      prompt: `${this.context(issue, stage, state, HOME, { reviewing: true })}\n\n# Approval\nYou are the approver (${role}) for ${what}. Hold it to your charter's bar. ` +
         `If you reject it, choose route_to (${back.join(', ')}) and give the exact changes in handoff.` +
         (stage === 'merge' ? ` Inspect the PRs with \`gh pr view\` / \`gh pr diff\` and the review and security artifacts.` : ''),
     });
@@ -731,7 +772,62 @@ export class Dispatcher {
   }
 
   // ── context every stage agent gets ──────────────────────────────────────
-  context(issue, stage, state, cwd) {
+  /**
+   * The issue's PR checks: waits up to gates.ci_wait_minutes while any are pending, then reports
+   * { status: pass | fail | none | timeout, table (markdown), failures: [{ repo, name, link, log }] }.
+   */
+  async ciGate(state, waitMinutes = this.cfg.gates?.ci_wait_minutes ?? 15) {
+    const until = Date.now() + waitMinutes * 60e3;
+    for (;;) {
+      const rows = [];
+      for (const [name, pr] of Object.entries(state.prs ?? {})) {
+        const r = this.repoByName(name);
+        for (const c of await T.prCheckList(r.repo, pr).catch(() => [])) rows.push({ repo: r.repo, name: c.name, bucket: c.bucket, link: c.link });
+      }
+      const table = rows.length ? `| Repo | Check | Result |\n|---|---|---|\n${rows.map((c) => `| ${c.repo} | ${c.name} | ${c.bucket} |`).join('\n')}` : '_No CI checks on the PR._';
+      const failed = rows.filter((c) => c.bucket === 'fail' || c.bucket === 'cancel');
+      if (failed.length) {
+        const failures = [];
+        for (const c of failed) failures.push({ ...c, log: await T.failedLog(c.repo, c) });
+        return { status: 'fail', table, failures };
+      }
+      if (!rows.some((c) => c.bucket === 'pending')) return { status: rows.length ? 'pass' : 'none', table, failures: [] };
+      if (Date.now() > until) return { status: 'timeout', table, failures: [] };
+      await new Promise((r) => setTimeout(r, 30e3));
+    }
+  }
+
+  /** The artifact a verdict stands for: the file the agent wrote during the run when it is the fuller text, else artifact_markdown. */
+  artifactOf(n, stage, res) {
+    const own = p('memory/specs', `issue-${n}`, `${stage}.md`), md = res.out?.artifact_markdown ?? '';
+    if (existsSync(own) && statSync(own).mtimeMs >= Date.now() - (res.ms ?? 0) - 2000) {
+      const written = readFileSync(own, 'utf8');
+      if (written.length > 2 * md.length) return written;
+    }
+    return md;
+  }
+
+  /** What a resumed agent needs: only what changed since its last run on this issue and stage. */
+  delta(issue, stage, state, since) {
+    const st = this.cfg.pipeline[stage];
+    const people = (issue.comments ?? []).filter((c) => !c.body.includes(T.MARK) && c.createdAt > since)
+      .map((c) => `- **${c.author?.login ?? 'person'}**: ${c.body.trim().slice(0, 1500)}`);
+    return [
+      `# Back to you: #${issue.number} \`${stage}\``,
+      `The work came back to you, so this continues your earlier session. Everything you read then still applies; don't re-read it.`,
+      state.lastHandoff ? `\n## What must change (from ${state.lastHandoff.by}, ${state.lastHandoff.from})\n${state.lastHandoff.text}` : '',
+      people.length ? `\n## New comments from people (authoritative)\n${people.join('\n')}` : '',
+      `\nFactory state now: loops=${state.loops} risk=${state.risk ?? 'unset'} prs=${this.prList(state) || 'none'}`,
+      `\nRevise your ${stage} work for exactly these changes, then hand in a complete verdict with the full artifact. Choose next_stage from: ${st.next.map((s) => `\`${s}\``).join(', ')}.`,
+    ].filter(Boolean).join('\n');
+  }
+
+  /**
+   * The brief for a stage run. It carries what agents used to spend their first steps reading (team digest, product brief,
+   * current answers, earlier artifacts, people's comments, the issue's history), because every extra step re-reads the whole
+   * conversation. Falls back to pointers when a digest doesn't exist yet.
+   */
+  context(issue, stage, state, cwd, { kb = null, reviewing = false } = {}) {
     const { cfg, repo } = this;
     const st = cfg.pipeline[stage];
     const role = st.role ?? st.council?.chair;
@@ -739,6 +835,30 @@ export class Dispatcher {
     const n = issue.number;
     const dossier = M.issueDossier(n);
     const opts = st.next.map((s) => `- \`${s}\`: ${cfg.pipeline[s]?.goal ?? (s === 'done' ? 'finished, close the issue' : 'close as not planned')}`).join('\n');
+    const read = (f) => { try { return readFileSync(p(f), 'utf8'); } catch { return ''; } };
+    const clip = (s, kb, file) => (s.length > kb * 1024 ? `${s.slice(0, kb * 1024)}\n\n…(truncated; the full file is ${p(file)})` : s);
+    const digest = read(`org/digests/${team}.md`), brief = read('memory/product/brief.md');
+    const answers = read('memory/product/answers.current.md') || read('memory/product/answers.md');
+
+    // Earlier artifacts, most relevant first, inline up to brief_kb: this stage's own last version (a loop-back), then upstream.
+    const UPSTREAM = { analysis: ['triage'], design: ['analysis'], 'feature-grooming': ['design', 'analysis'], 'tech-grooming': ['feature-grooming', 'design'],
+      build: ['tech-grooming', 'feature-grooming'], review: ['tech-grooming', 'feature-grooming', 'build'], security: ['tech-grooming', 'review', 'build'],
+      release: ['security', 'review'], verify: ['release', 'verify'], incident: ['verify'] };
+    let room = (kb ?? cfg.economy?.brief_kb ?? 40) * 1024;
+    const inline = [];
+    for (const s of [stage, ...(UPSTREAM[stage] ?? [])]) {
+      const f = `memory/specs/issue-${n}/${s}.md`, body = read(f);
+      if (!body || room < 2048) continue;
+      const text = clip(body, Math.min(s === stage ? 24 : 12, room / 1024), f);
+      room -= text.length;
+      inline.push(`\n### ${s !== stage ? s : reviewing ? `The ${s} artifact under review` : `Your last ${s} (revise it; don't start over)`} · ${p(f)}\n${text}`);
+    }
+    const people = (issue.comments ?? []).filter((c) => !c.body.includes(T.MARK)).slice(-8)
+      .map((c) => `- **${c.author?.login ?? 'person'}** (${String(c.createdAt).slice(0, 16).replace('T', ' ')}): ${c.body.trim().slice(0, 1500)}`);
+    const history = dossier.events.filter((e) => ['transition', 'check_failed', 'escalated', 'human_approved', 'vendor_request', 'loop_back', 'council_closed'].includes(e.type))
+      .slice(-12).map((e) => `- ${e.ts.slice(0, 16).replace('T', ' ')} ${e.type}${e.stage ? ` ${e.stage}` : ''}${e.to ? ` → ${e.to}` : ''} (${e.actor})${e.summary ? `: ${e.summary.replace(/\s+/g, ' ').slice(0, 200)}` : ''}`);
+    const lint = !reviewing && (st.checks ?? []).includes('spec_lint')
+      ? `\n## Before you hand in\nWrite your draft to ${p('memory/specs', `issue-${n}`, `${stage}.md`)} and run \`sf lint spec ${n}\`. Fix every item it reports, then hand in. A spec that fails the lint comes straight back to you.` : '';
     return [
       `# Issue #${n}: ${issue.title}`, `Tracker: ${repo} · ${issue.url ?? ''}`, `Now: ${now().toString()}`, '',
       `## Your stage: \`${stage}\``, st.goal, '',
@@ -747,21 +867,30 @@ export class Dispatcher {
       `priority=${T.priorityOf(issue)} risk=${state.risk ?? 'unset'} loops=${state.loops} repos=${this.touched(state).map((r) => r.name).join(',')} prs=${this.prList(state) || 'none'} deployed=${JSON.stringify(state.deployed ?? {})}`,
       ...(() => { const A = this.answersLatest ?? []; return A.length ? [`\n## Owner answers (newest first; these override answers.md and any earlier assumption)`,
         ...A.map((a) => `- **#${a.request}** (${a.ts.slice(0, 16).replace('T', ' ')} UTC): ${a.text.replace(/\s+/g, ' ').slice(0, 300)}`)] : []; })(),
-      `\n## Product knowledge (read before acting)`,
-      `- ${p('memory/product/overview.md')}: what the product is, the system map, and environments`,
-      ...this.repos.map((r) => `- ${p('memory/product/repos', `${r.name}.md`)}: ${r.name} (${r.repo})`),
-      `- ${p('memory/product/answers.md')}: the product owner's answers`,
       state.lastHandoff ? `\n## Handoff to you from ${state.lastHandoff.by} (${state.lastHandoff.from})\n${state.lastHandoff.text}` : '',
-      dossier.artifacts.length ? `\n## Artifacts so far (read the relevant ones)\n${dossier.artifacts.map((a) => `- ${p(a)}`).join('\n')}` : '',
+      people.length ? `\n## What people said on the issue (authoritative)\n${people.join('\n')}` : '',
+      issue.ci ? `\n## CI on the PR right now (${issue.ci.status === 'timeout' ? 'some checks still running' : issue.ci.status})\n${issue.ci.table}\n` +
+        `You can't advance while any check is red: the dispatcher sends red CI back to build automatically.` +
+        (issue.ci.failures.length ? `\n${issue.ci.failures.map((f) => `\n**${f.repo}: ${f.name}** (failing log tail)\n\`\`\`\n${(f.log || '').slice(-2000)}\n\`\`\``).join('')}` : '') : '',
+      history.length ? `\n## History of this issue\n${history.join('\n')}` : '',
+      digest ? `\n## How your team works (digest of the operating model and the ${team} charter)\n${digest}` : '',
+      brief ? `\n## The product (brief)\n${brief}` : '',
+      answers ? `\n## Owner answers (current)\n${clip(answers, 8, 'memory/product/answers.current.md')}` : '',
+      inline.length ? `\n## Earlier work on this issue\n${inline.join('\n')}` : '',
+      `\n## More, only if this brief doesn't answer it`,
+      `- Full documents: ${p('org/operating-model.md')}, ${p('org/charters', `${team}.md`)}, ${p('memory/product/overview.md')}, ${p('memory/product/answers.md')}`,
+      ...this.repos.map((r) => `- ${p('memory/product/repos', `${r.name}.md`)}: ${r.name} (${r.repo})`),
+      dossier.artifacts.length ? `- Every artifact (older versions too): ${dossier.artifacts.map((a) => p(a)).join(', ')}` : '',
+      `- \`sf recall "<keywords>"\` for decisions and learnings from other issues.`,
       st.workspace ? `\n## Workspace (cwd: ${cwd})\nOne sub-folder per repo, each a git worktree on branch \`sf/issue-${n}\`:\n${this.touched(state).map((r) => `- \`${r.name}/\`: ${r.repo} (base \`origin/${r.default_branch}\`)`).join('\n')}\nOnly change repos the tech design names. If another repo must change, loop back to tech-grooming.` : '',
       stage === 'release' ? `\n## Go-live policy\n${cfg.release.policy}\nEnvironments in order: ${this.envs.join(' → ')}. Already deployed: ${JSON.stringify(state.deployed ?? {})}. The next one is **${this.nextEnv(state)}**.\nRecent deploys:\n${this.touched(state).filter((r) => r.deploy_workflow).map((r) => `- \`gh run list -R ${r.repo} --workflow ${r.deploy_workflow} --limit 10\``).join('\n')}` : '',
       stage === 'verify' ? `\n## Validate ${state.lastEnv ?? 'the deploy'} (deployed ${state.deployed?.[state.lastEnv] ?? '?'})\n${this.profile(state.lastEnv) ? `You have read-only AWS access (profile \`${this.profile(state.lastEnv)}\`, region ${cfg.aws?.region}). Start with \`aws sts get-caller-identity --profile ${this.profile(state.lastEnv)}\`.` : 'This environment runs on the local machine. Use the health URLs and the deploy log.'}\n` +
         `Health URLs:\n${this.touched(state).map((r) => `- ${r.name}: ${r.health?.[state.lastEnv] || '(none configured)'}`).join('\n')}\nSignals:\n${this.signals(state.lastEnv, this.touched(state)).map((s) => `- \`${s}\``).join('\n')}\n` +
         `Environments: ${this.envs.join(' → ')}. If ${state.lastEnv} is healthy and it isn't the last environment, choose \`release\` to promote. If it is the last, choose \`done\`. A regression goes to \`build\`, and if users are impacted, say "rollback" in decisions.` : '',
-      `\n## Before you act`,
-      `1. Read ${p('org/operating-model.md')} and ${p('org/charters', `${team}.md`)} if they exist.`,
-      `2. Run \`gh issue view ${n} -R ${repo} --comments\`. Human comments are authoritative.`,
-      `3. Run \`sf memory issue ${n}\` and \`sf recall "<keywords>"\` for prior decisions and learnings.`,
+      `\n## How to work`,
+      `This brief already holds the digest, the product brief, the answers, the issue's comments and history, and the earlier artifacts. ` +
+        `Don't re-read them or re-run \`gh issue view\` and \`sf memory issue\`. Spend your steps on the work itself; read the full documents only for a specific gap.`,
+      lint,
       `\n## Choose next_stage from`, opts,
       `\nUse \`advance\` to move forward, \`loop_back\` to send work upstream (say exactly what must change in \`handoff\`), \`reject\` to close, and \`blocked\` to ask a human.`,
       `Put the full stage artifact in \`artifact_markdown\`.`,

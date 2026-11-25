@@ -31,6 +31,17 @@ npm install
 bin/sf dashboard            # open http://127.0.0.1:4340
 ```
 
+**Dashboard port.** The default is 4340. If 4340 is taken, the dashboard uses the next free port and prints which one.
+To choose the port yourself:
+
+| How | Lasts | If the port is taken |
+|---|---|---|
+| `sf dashboard --port 5050` | this start | refuses and says so |
+| `SF_DASHBOARD_PORT=5050 sf dashboard` | this shell | refuses and says so |
+| `dashboard.port: 5050` in `org/org.yaml` | every start | uses the next free port |
+
+Setup saves the port the dashboard was on, so it comes back on the same one.
+
 The dashboard walks you through the rest. You don't need any other commands:
 
 1. **Set up.** It checks this computer, then asks for your company name, your GitHub login (you are the owner and the client)
@@ -48,6 +59,25 @@ New installs start from `templates/org/`.
 
 Scoped tool permissions in `org/org.yaml` use `{FACTORY}` for the install folder (for example `Write(/{FACTORY}/memory/specs/*/verify.md)`),
 so the same config works on any machine.
+
+## Cost: how the factory keeps token use down
+
+Each agent run is a separate Claude Code session, so there is no shared context to bloat; shared memory is files on disk.
+What costs money is **steps**: every step an agent takes re-reads its whole conversation so far. The factory keeps steps and
+reruns down, and `economy` in `org/org.yaml` controls it:
+
+| Lever | What it does |
+|---|---|
+| Packed briefs | The brief already holds the team digest, product brief, current answers, people's comments, the issue history and earlier artifacts (up to `brief_kb`). Agents start working instead of reading. |
+| Digests | `org/digests/<team>.md` and `memory/product/brief.md` are short versions of the operating model, charters and product overview. They're rewritten only when a source changes. `answers.current.md` drops superseded answers. |
+| Per-task model, effort and cap | `economy.tasks`: the first rule whose `task` prefixes the run label picks the model (e.g. Haiku for triage, Sonnet for approvals and councils), `--effort` and the budget cap. |
+| Finish-now | A run that hits its cap gets one short "hand in what you have" turn in the same session instead of being thrown away. |
+| Check retries | A spec that fails `spec_lint` is fixed in the same session (`check_retries`), not in a fresh run next tick. |
+| Session resume | When work comes back to the same role and stage within `resume_minutes`, the agent continues its earlier session and gets only what changed. |
+| Councils | `council_rounds`, and another round only while members disagree on the route. |
+
+The dashboard's **Spend** panel shows cost, steps and tokens by role and by task, the share spent on rework, and each task's
+average cost before and after the economy rules started.
 
 ## Working from the terminal
 

@@ -130,6 +130,20 @@ export async function prChecks(repo, pr) {
   if (checks.some((c) => c.bucket === 'pending')) return 'pending';
   return 'pass';
 }
+/** Every check on a PR: [{ name, bucket, state, link }]. [] when the repo has no checks. */
+export async function prCheckList(repo, pr) {
+  let out;
+  try { out = (await run('gh', ['pr', 'checks', String(pr), '-R', repo, '--json', 'name,bucket,state,link'])).stdout; }
+  catch (e) { if (/no checks/i.test(e.stderr ?? '')) return []; if (!e.stdout) throw e; out = e.stdout; }
+  return JSON.parse(out || '[]');
+}
+/** The failing steps' log lines for a failed check, from its Actions run (tail only: that's where the error is). */
+export async function failedLog(repo, check, lines = 60) {
+  const run = String(check.link ?? '').match(/\/actions\/runs\/(\d+)/)?.[1];
+  if (!run) return '';
+  const log = await gh(['run', 'view', run, '-R', repo, '--log-failed']).catch(() => '');
+  return log.split('\n').slice(-lines).join('\n');
+}
 export async function prMergeable(repo, pr) {
   const { mergeable } = await json(['pr', 'view', String(pr), '-R', repo, '--json', 'mergeable']);
   return mergeable; // MERGEABLE | CONFLICTING | UNKNOWN
