@@ -90,9 +90,20 @@ export function similar(a, b, threshold = 0.25) { // tuned on real duplicate req
  * File a request once: if an open issue with the same label asks for the same thing, add this as a comment ("+1, with evidence")
  * instead of opening a duplicate. Returns { n, duplicate }.
  */
+/** A person's device or smoke test of the same build is one test, whichever issue asks for it (Release 1: every release item
+ *  filed its own iPhone test of build 144e4de). Same commit sha (7+ hex) in both, and both are device/smoke checks. */
+export function sameBuildCheck(a, b) {
+  const kind = /smoke|real device|device test|iphone|android/i;
+  if (!kind.test(a) || !kind.test(b)) return false;
+  const shas = (s) => new Set((s.match(/\b[0-9a-f]{7,40}\b/g) ?? []).filter((x) => /[a-f]/.test(x)).map((x) => x.slice(0, 7)));
+  const sa = shas(a);
+  return [...shas(b)].some((x) => sa.has(x));
+}
+
 export async function fileOnce(repo, { title, body, labels }) {
   const open = await json(['issue', 'list', '-R', repo, '--state', 'open', '--label', labels[0], '--limit', '100', '--json', 'number,title,body']).catch(() => []);
-  const dup = (open ?? []).find((i) => similar(`${i.title} ${i.body ?? ''}`.slice(0, 1500), `${title} ${body}`.slice(0, 1500)));
+  const dup = (open ?? []).find((i) => sameBuildCheck(`${i.title} ${i.body ?? ''}`, `${title} ${body}`)
+    || similar(`${i.title} ${i.body ?? ''}`.slice(0, 1500), `${title} ${body}`.slice(0, 1500)));
   if (dup) { await comment(repo, dup.number, `**Also requested** (merged as a duplicate):\n${title}\n\n${body}`); return { n: dup.number, duplicate: true }; }
   return { n: await createIssue(repo, { title, body, labels }), duplicate: false };
 }
