@@ -97,3 +97,12 @@ test('#141: a second review → security while the issue is already at security 
   assert.equal(duplicateTransition(again, 'review', 'security', 'advance'), false, 'a repeat after a move in between is real');
   assert.equal(duplicateTransition({ loops: 0, history: [] }, 'review', 'security', 'advance'), false, 'first time through');
 });
+
+// #5: merged and held at release for a parent's fix; a superseded dependency sent it back to feature-grooming (5 wasted runs).
+test('#5: a superseded dependency never sends merged code back to re-spec', async () => {
+  const { supersededRoute } = await import('../factory/lib/dispatcher.mjs');
+  const c = { ...cfg, pipeline: { 'feature-grooming': { role: 'engineer', next: ['tech-grooming'] }, 'tech-grooming': { role: 'engineer', next: ['build'] }, ...cfg.pipeline } };
+  assert.equal(supersededRoute(c, { merged: { enwallet: '2026-11-25T10:42:01Z' } }, 'release'), 'release', 'merged: stays and waits');
+  assert.equal(supersededRoute(c, {}, 'build'), 'feature-grooming', 'unmerged past feature-grooming: rework the spec');
+  assert.equal(supersededRoute(c, {}, 'feature-grooming'), 'feature-grooming');
+});

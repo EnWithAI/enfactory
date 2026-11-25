@@ -51,6 +51,9 @@ test('a real conflict is left to the engineer: aborted, nothing pushed', async (
     f.parent('b.txt', 'b from the parent\n');
     const res = await autoRebase(N, r);
     assert.equal(res.result, 'conflict');
+    assert.deepEqual(res.files, ['b.txt'], '#166: the clashing file is named');
+    assert.match(res.causedBy[0], /parent edits b\.txt/, '#166: and the merged commit that caused it');
+    assert.equal(res.behind, 1);
     assert.equal(git(f.wt, 'rev-parse', 'HEAD'), before, 'worktree back where it was');
     assert.ok(!existsSync(path.join(f.wt, '.git', 'rebase-merge')), 'no rebase left in progress');
     assert.equal(git(f.origin, 'rev-parse', branch(N)), before, 'PR branch untouched');

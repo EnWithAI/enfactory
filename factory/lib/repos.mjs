@@ -84,8 +84,12 @@ export async function autoRebase(n, r) {
   try {
     await git(['-c', `user.name=${studio()} factory`, '-c', 'user.email=factory@localhost', 'rebase', '-q', `origin/${r.default_branch}`], wt);
   } catch {
+    // Name what clashes and what caused it, so the engineer starts from the files, not from "it conflicts" (#166).
+    const files = (await git(['diff', '--name-only', '--diff-filter=U'], wt).catch(() => '')).split('\n').filter(Boolean);
     await git(['rebase', '--abort'], wt).catch(() => {});
-    return { result: 'conflict', from };
+    const behind = Number(await git(['rev-list', '--count', `HEAD..origin/${r.default_branch}`], wt).catch(() => 0));
+    const causedBy = files.length ? (await git(['log', '--format=%h %s', `HEAD..origin/${r.default_branch}`, '--', ...files], wt).catch(() => '')).split('\n').filter(Boolean) : [];
+    return { result: 'conflict', from, files, causedBy, behind };
   }
   const to = await git(['rev-parse', 'HEAD'], wt);
   if (to !== from) {

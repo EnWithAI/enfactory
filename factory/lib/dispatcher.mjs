@@ -135,6 +135,14 @@ export function repeatsAdvance(cfg, state, stage, artifact, events = []) {
 export function duplicateTransition(state, stage, next, outcome) {
   return outcome === 'advance' && stage !== next && state.moved?.from === stage && state.moved.to === next;
 }
+/** Where an issue goes when a dependency it waited on closes without being done: unmerged work past feature-grooming
+ *  reworks its spec; merged code, or anything earlier, stays at its stage. */
+export function supersededRoute(cfg, state, stage) {
+  if (Object.keys(state.merged ?? {}).length) return stage;
+  const order = STAGE_ORDER(cfg);
+  return order.indexOf(stage) > order.indexOf('feature-grooming') ? 'feature-grooming' : stage;
+}
+
 /** Whether a `continue` verdict may run the stage again (economy.continue_runs per stage; reset by any other outcome). */
 export function mayContinue(cfg, state, stage) {
   const max = cfg.economy?.continue_runs ?? 2, done = state.continues?.[stage] ?? 0;
@@ -324,9 +332,12 @@ export class Dispatcher {
           const repl = gone.map((g) => g.replacement).filter((r) => r && open.has(r));
           for (const g of gone) M.record('dependency_superseded', { parent: g.m, reason: g.reason, replacement: g.replacement ?? null }, { issue: n });
           state.waitFor = repl.length ? repl : null;
-          const order = STAGE_ORDER(cfg), to = order.indexOf(stage) > order.indexOf('feature-grooming') ? 'feature-grooming' : stage;
+          // Code already merged (#5: held at release for a parent's fix) has nothing to re-spec: it stays where it is and waits for
+          // the replacement. Only unmerged work past feature-grooming goes back to rework its spec.
+          const shipped = Object.keys(state.merged ?? {}).length > 0, to = supersededRoute(cfg, state, stage);
           state.lastHandoff = { from: 'dependency', by: 'dispatcher', text: gone.map((g) => `Parent #${g.m} closed as ${g.reason.toLowerCase().replace('_', ' ')}${g.replacement ? ` (→ #${g.replacement})` : ''}.`).join(' ') +
-            (repl.length ? ` Re-parent onto ${repl.map((r) => `#${r}`).join(', ')}: rework the spec against it; it waits for it again.` : ' Rework the spec without it, or cut the issue.') };
+            (shipped ? ` This issue's code is already merged, so it stays at \`${stage}\`${repl.length ? ` and waits for ${repl.map((r) => `#${r}`).join(', ')}` : ''}.`
+              : repl.length ? ` Re-parent onto ${repl.map((r) => `#${r}`).join(', ')}: rework the spec against it; it waits for it again.` : ' Rework the spec without it, or cut the issue.') };
           M.saveIssueState(n, state);
           await T.comment(this.repo, n, `### ↪️ ${state.lastHandoff.text}${to !== stage ? `\nBack to \`${to}\`.` : ''}`);
           if (to !== stage) await this.move(issue, stage, to, state);
@@ -501,7 +512,7 @@ export class Dispatcher {
       }
       if (conflicts.length) conflicts = await this.rebaseConflicts(n, state, conflicts);
       if (conflicts.length) {
-        state.lastHandoff = { from: stage, by: 'git', text: `The PR(s) now conflict with the default branch in: ${conflicts.join(', ')} (an earlier PR merged underneath). In each, run \`git fetch origin && git rebase origin/<default>\`, resolve the conflicts keeping both changes' intent, re-run all tests, commit and hand back to review.` };
+        state.lastHandoff = { from: stage, by: 'git', text: `The PR(s) now conflict with the default branch (an earlier PR merged underneath), and git couldn't rebase them cleanly:\n${this.clashText(state, conflicts)}\nIn each, run \`git fetch origin && git rebase origin/<default>\`, resolve the conflicts keeping both changes' intent, re-run all tests, commit and hand back to review.` };
         M.saveIssueState(n, state);
         M.record('transition', { stage, to: 'build', outcome: 'loop_back', loop: false, kind: 'rebase_needed', summary: `PR conflicts after a parent merge: ${conflicts}` }, { actor: 'git', issue: n });
         await T.comment(this.repo, n, `### 🔁 PR conflicts with the default branch (${conflicts.join(', ')}): back to \`build\` to rebase before \`${stage}\``);
@@ -1060,7 +1071,7 @@ export class Dispatcher {
     }
     if (conflicts.length) {
       state.loops += 1;
-      state.lastHandoff = { from: 'merge', by: 'git', text: `PR(s) conflict with the default branch in: ${conflicts.join(', ')}. In each, run \`git fetch origin && git rebase origin/<default>\`, resolve the conflicts keeping both changes' intent, re-run all tests, and commit.` };
+      state.lastHandoff = { from: 'merge', by: 'git', text: `PR(s) conflict with the default branch, and git couldn't rebase them cleanly:\n${this.clashText(state, conflicts)}\nIn each, run \`git fetch origin && git rebase origin/<default>\`, resolve the conflicts keeping both changes' intent, re-run all tests, and commit.` };
       M.saveIssueState(n, state);
       M.record('transition', { stage: 'merge', to: 'build', outcome: 'loop_back', loop: true, loops: state.loops, summary: `merge conflict: ${conflicts}` }, { issue: n });
       await T.comment(repo, n, `### 🔁 Merge conflict (${conflicts.join(', ')}), requeued to \`build\` to rebase`);
@@ -1398,6 +1409,7 @@ export class Dispatcher {
       if (!r || !pr || !(await T.hasActiveCi(r.repo))) { still.push(name); continue; }
       const res = await R.autoRebase(n, r).catch((e) => ({ result: 'error', error: String(e.message).slice(0, 300) }));
       M.record('auto_rebase', { repo: name, pr, ...res }, { actor: 'git', issue: n });
+      if (res.result === 'conflict') (state.clashes ??= {})[name] = { files: res.files ?? [], causedBy: res.causedBy ?? [], behind: res.behind };
       if (res.result !== 'rebased') { still.push(name); continue; }
       state.heads = { ...(state.heads ?? {}), [name]: res.to };
       state.awaitCi = { ...(state.awaitCi ?? {}), [name]: res.to }; // until checks show up on the new commit, CI is pending
@@ -1408,6 +1420,16 @@ export class Dispatcher {
       await T.comment(this.repo, n, `### 🔀 Rebased onto the default branch automatically: ${done.join(', ')}\nAn earlier PR merged underneath. git rebased with no conflicts, so no build run was needed. CI re-runs on the rebased branch and gates review and merge as usual.`);
     }
     return still;
+  }
+  /** The conflict detail for a handoff: per repo, the clashing files and the merged commits that touched them. */
+  clashText(state, names) {
+    const lines = names.map((name) => {
+      const c = state.clashes?.[name];
+      if (!c?.files?.length) return `- ${name}: conflicts with the default branch.`;
+      return `- ${name}: ${c.behind ?? '?'} commit(s) behind. Conflicting files: ${c.files.map((f) => `\`${f}\``).join(', ')}.` +
+        (c.causedBy.length ? ` Merged since your branch, touching them: ${c.causedBy.slice(0, 8).join('; ')}.` : '');
+    });
+    return lines.join('\n');
   }
 
   repoByName(name) { return this.repos.find((r) => r.name === name) ?? (this.factory?.name === name ? this.factory : undefined); }
