@@ -10,10 +10,10 @@ const here = dirname(fileURLToPath(import.meta.url));
 const dist = join(here, '..', 'dist');
 let mode = 'ok';
 try { mode = readFileSync(join(here, 'mode'), 'utf8').trim(); } catch {}
-const { HOST, PORT, ENWALLET_DB, ENWALLET_SHA, FIXTURE_TRACE, FIXTURE_MARKER } = process.env;
+const { HOST, PORT, ENWALLET_DB, ENWALLET_SHA, SF_RELEASE_SHA, FIXTURE_TRACE, FIXTURE_MARKER } = process.env;
 if (FIXTURE_TRACE) {
   writeFileSync(FIXTURE_TRACE, JSON.stringify({
-    argv: process.argv.slice(2), argvLen: process.argv.length, argv1: process.argv[1], HOST, PORT, ENWALLET_DB, ENWALLET_SHA, pid: process.pid,
+    argv: process.argv.slice(2), argvLen: process.argv.length, argv1: process.argv[1], HOST, PORT, ENWALLET_DB, ENWALLET_SHA, SF_RELEASE_SHA, pid: process.pid,
   }));
 }
 // #110: like #3's server (CLI `server/index.mjs <port> <dataDir>`), the port and data dir come from argv only. PORT and
@@ -33,7 +33,7 @@ createServer((req, res) => {
     if (mode === '500') { res.writeHead(500); res.end('{}'); return; }
     if (mode === 'nojson') { res.writeHead(200); res.end('not json'); return; }
     const db = { dbfalse: false, dbstring: 'ok' }[mode] ?? true;
-    const body = { ok: mode !== 'okfalse', db, sha: mode === 'badsha' ? 'deadbee' : ENWALLET_SHA };
+    const body = { ok: mode !== 'okfalse', db, sha: mode === 'badsha' ? 'deadbee' : (SF_RELEASE_SHA || 'unknown') };
     if (mode === 'nodb') delete body.db;
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify(body));

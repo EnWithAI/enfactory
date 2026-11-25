@@ -534,8 +534,9 @@ test('AC-110-01 starts server with positional <port> <dataDir>', async () => {
 test('AC-110-02 env vars kept alongside argv', () => {
   const t = deployTraced(join(T, 'envs-110'), C, p110);
   assert.deepEqual(
-    { HOST: t.HOST, PORT: t.PORT, ENWALLET_DB: t.ENWALLET_DB, ENWALLET_SHA: t.ENWALLET_SHA },
-    { HOST: '127.0.0.1', PORT: String(p110), ENWALLET_DB: join(R110, 'data', 'enwallet.db'), ENWALLET_SHA: C.sha },
+    { HOST: t.HOST, PORT: t.PORT, ENWALLET_DB: t.ENWALLET_DB, ENWALLET_SHA: t.ENWALLET_SHA, SF_RELEASE_SHA: t.SF_RELEASE_SHA },
+    // SF_RELEASE_SHA is what enwallet's server/health.mjs reports (#80); without it every staging deploy failed its probe.
+    { HOST: '127.0.0.1', PORT: String(p110), ENWALLET_DB: join(R110, 'data', 'enwallet.db'), ENWALLET_SHA: C.sha, SF_RELEASE_SHA: C.sha },
   );
 });
 

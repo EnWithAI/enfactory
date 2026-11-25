@@ -6,7 +6,8 @@
 #   refused unless staging (127.0.0.1:${SF_STAGING_PORT:-4310}) reports ok, db and the same sha; a production rollback never asks staging.
 # Exit codes: 0 live · 1 deploy/rollback failed (nothing left half-switched) · 2 invalid input (no build ran)
 # Server contract: node <root>/current/server/index.mjs <port> <root>/data (#3 CLI: server/index.mjs <port> <dataDir>),
-#   with env HOST=127.0.0.1 PORT=<port> ENWALLET_DB=<root>/data/enwallet.db ENWALLET_SHA=<sha>; GET /api/health → 200 {"ok":true,"db":true,"sha":"<sha>"}.
+#   with env HOST=127.0.0.1 PORT=<port> ENWALLET_DB=<root>/data/enwallet.db ENWALLET_SHA=<sha> SF_RELEASE_SHA=<sha>
+#   (enwallet server/health.mjs reports SF_RELEASE_SHA, #80); GET /api/health → 200 {"ok":true,"db":true,"sha":"<sha>"}.
 # The store under <root>/data is never copied, moved or deleted here.
 set -euo pipefail
 umask 077 # [S4] deploy.log, server.log, server.pid, releases/ and data/ are owner-only.
@@ -116,7 +117,7 @@ start() {
   step=start off=0
   if [[ -f $R/server.log ]]; then off=$(wc -c <"$R/server.log"); off=${off//[[:space:]]/}; fi
   log "· start $name@$id on 127.0.0.1:$port"
-  HOST=127.0.0.1 PORT=$port ENWALLET_DB="$R/data/enwallet.db" ENWALLET_SHA=$id \
+  HOST=127.0.0.1 PORT=$port ENWALLET_DB="$R/data/enwallet.db" ENWALLET_SHA=$id SF_RELEASE_SHA=$id \
     nohup node "$R/current/server/index.mjs" "$port" "$R/data" </dev/null >>"$R/server.log" 2>&1 &
   printf '%s\n' "$!" >"$R/server.pid"
 }
