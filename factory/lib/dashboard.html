@@ -912,7 +912,15 @@ function renderWaiting(w) {
         const j = await r.json();
         if (!r.ok) throw new Error(j.error ?? 'The dashboard server refused the action.');
         delete drafts[i.n]; waitSig = ''; renderWaiting(j);
-      } catch (err) { msg.className = 'msg err'; msg.textContent = `${err.message} Nothing was changed on GitHub. Fix it and try again.`; btns.forEach((b) => { b.disabled = false; }); }
+      } catch (err) {
+        // A GitHub outage is not the person's mistake, and part of the action (the comment) may already be saved.
+        const outage = /Something went wrong while executing your query|50[0-9]|Bad Gateway|timed out|ECONNRESET/i.test(err.message);
+        msg.className = 'msg err';
+        msg.textContent = outage
+          ? 'GitHub had a temporary error (retried 3 times). Your comment may already be on the issue. Wait a minute and click again; it is safe to repeat.'
+          : `${err.message} Nothing was changed on GitHub.`;
+        btns.forEach((b) => { b.disabled = false; });
+      }
     } }, ACTION[a][0]));
     return el('article', { class: 'witem', 'aria-labelledby': `wt-${i.n}` },
       el('h3', { id: `wt-${i.n}` }, el('span', { class: `pill ${KIND[i.kind][1]}` }, KIND[i.kind][0]), i.title,

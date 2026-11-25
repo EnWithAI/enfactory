@@ -6,7 +6,24 @@ const run = promisify(execFile);
 const STAGE = 'sf/';
 export const L = { working: 'sf-working', human: 'sf-needs-human', approved: 'sf-approved' };
 
-export async function gh(args, { input, cwd } = {}) {
+// GitHub's own temporary failures (2026-11-25: label edits, closes and comments failed for an afternoon with
+// "Something went wrong while executing your query" and HTTP 500/502, while its status page showed no incident).
+export const TRANSIENT = /Something went wrong while executing your query|HTTP 50[0-9]|status code: 50[0-9]|50[0-9] (Bad Gateway|Service Unavailable|Internal Server Error)|connection reset|ECONNRESET|ETIMEDOUT|i\/o timeout|EAI_AGAIN/i;
+const WAITS = [1e3, 4e3, 10e3];
+// Creating an issue or PR is not retried: a 5xx may still have created it, and a duplicate costs real work.
+const once = (args) => /^(issue|pr)$/.test(args[0]) && args[1] === 'create';
+
+/** Run gh; temporary GitHub failures are retried up to 3 times (1s, 4s, 10s) before the error reaches the caller. */
+export async function gh(args, opts = {}) {
+  for (let i = 0; ; i++) {
+    try { return await ghOnce(args, opts); }
+    catch (e) {
+      if (i >= WAITS.length || once(args) || !TRANSIENT.test(`${e.stderr ?? ''} ${e.message}`)) throw e;
+      await new Promise((r) => setTimeout(r, WAITS[i]));
+    }
+  }
+}
+async function ghOnce(args, { input, cwd } = {}) {
   if (input === undefined) {
     const { stdout } = await run('gh', args, { maxBuffer: 64 << 20, cwd });
     return stdout.trim();
