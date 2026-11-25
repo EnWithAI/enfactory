@@ -135,6 +135,30 @@ export function repeatsAdvance(cfg, state, stage, artifact, events = []) {
 export function duplicateTransition(state, stage, next, outcome) {
   return outcome === 'advance' && stage !== next && state.moved?.from === stage && state.moved.to === next;
 }
+/** A tech design's `Touches: ui=y storage=n csp=n` line as booleans; a key that isn't stated is null. */
+export function touchesOf(md) {
+  const line = String(md ?? '').match(/^Touches:(.*)$/im)?.[1] ?? '';
+  const flag = (k) => { const m = line.match(new RegExp(`\\b${k}\\s*[=:]\\s*(y|yes|n|no)\\b`, 'i')); return m ? /^y/i.test(m[1]) : null; };
+  return { ui: flag('ui'), storage: flag('storage'), csp: flag('csp') };
+}
+/** A verify loop-back to build over the release-wide CSP header, from an issue whose design says csp=n (#6, COE requests
+ *  #180/#182): not that issue's defect. A verdict that also names a regression of its own is left alone. */
+export function offScopeCsp(v, touches, next) {
+  const text = `${v.summary ?? ''}\n${v.handoff ?? ''}`;
+  return next === 'build' && touches.csp === false && /\bCSP\b|Content-Security-Policy/i.test(text) && !/\bregress(ion|ed)\b/i.test(text);
+}
+/** How SRE already ruled on the build now deployed to `env`: the last good deploy's sha, and the verify verdicts since. */
+export function rulingsOn(evs, env) {
+  const dep = evs.filter((e) => e.type === 'deploy' && e.env === env && e.ok).at(-1);
+  if (!dep) return null;
+  const shaOf = (e) => String(e.log ?? '').match(/@([0-9a-f]{7,40})/)?.[1] ?? null;
+  const sha = shaOf(dep);
+  // Each release run redeploys the same build: count rulings from the first good deploy of this sha.
+  const first = sha ? evs.find((e) => e.type === 'deploy' && e.env === env && e.ok && shaOf(e) === sha) : dep;
+  const verdicts = evs.filter((e) => e.type === 'transition' && e.stage === 'verify' && e.ts > first.ts).slice(-6);
+  return { sha, at: first.ts, verdicts };
+}
+
 /** The dependencies still worth waiting for: those whose code has not merged yet. */
 export const pendingDeps = (deps, stateOf) => deps.filter((m) => !Object.keys(stateOf(m)?.merged ?? {}).length);
 
@@ -700,6 +724,16 @@ export class Dispatcher {
       }
     }
     let next = v.outcome === 'blocked' || v.outcome === 'wait' ? 'blocked' : v.next_stage; // `wait` without issues to wait for is a block
+    // Before anything counts it as a loop: verify bouncing an issue to build over the release-wide CSP header, when its design
+    // says csp=n, is not that issue's defect (#6: verify → build → engineer → council → tech-grooming, 9 runs). Route to release.
+    if (stage === 'verify' && !v.rollback && st.next.includes('release')) {
+      const own = p('memory/specs', `issue-${n}`, 'tech-grooming.md');
+      if (offScopeCsp(v, touchesOf(existsSync(own) ? readFileSync(own, 'utf8') : ''), next)) {
+        M.record('scope_guard', { stage, from: 'build', to: 'release', check: 'csp', summary: v.summary?.slice(0, 300) }, { actor: role, issue: n });
+        await T.comment(repo, n, `### 🧭 Not this issue's defect: \`verify → build\` changed to \`release\`\nThe failing check was the release-wide CSP header, and this issue's design says \`csp=n\`. Production stays held until the owning issue lands; nothing here is rebuilt. If verify also found a regression this change caused, raise it again naming it.`);
+        next = 'release'; v.outcome = 'advance';
+      }
+    }
     // Council stages route rather than loop, and `forward` targets (verify → release = promote) are progress.
     const isLoop = !st.council && !(st.forward ?? []).includes(next) && order.includes(next) && order.indexOf(next) < order.indexOf(stage);
 
@@ -1638,7 +1672,9 @@ export class Dispatcher {
         `If the change has nothing to run (no build, no server, no bundle change), set \`no_runtime_surface: true\` with a \`no_runtime_note\` saying why, and no deploy or probe runs.\nRecent deploys:\n${this.deployable(state).filter((r) => r.deploy_workflow).map((r) => `- \`gh run list -R ${r.repo} --workflow ${r.deploy_workflow} --limit 10\``).join('\n')}` : '',
       stage === 'verify' ? `\n## Validate ${state.lastEnv ?? 'the deploy'} (${state.deployed?.[state.lastEnv] ? `deployed ${state.deployed[state.lastEnv]}` : state.noRuntime?.[state.lastEnv] ? `not deployed: the release manager declared no runtime surface at ${state.noRuntime[state.lastEnv]}; confirm nothing needed to run` : 'deployed ?'})\n${this.profile(state.lastEnv) ? `You have read-only AWS access (profile \`${this.profile(state.lastEnv)}\`, region ${cfg.aws?.region}). Start with \`aws sts get-caller-identity --profile ${this.profile(state.lastEnv)}\`.` : 'This environment runs on the local machine. Use the health URLs and the deploy log.'}\n` +
         `Health URLs:\n${this.deployable(state).map((r) => `- ${r.name}: ${r.health?.[state.lastEnv] || '(none configured)'}`).join('\n')}\nSignals:\n${this.signals(state.lastEnv, this.deployable(state)).map((s) => `- \`${s}\``).join('\n')}\n` +
-        `Environments: ${this.envs.join(' → ')}. If ${state.lastEnv} is healthy and it isn't the last environment, choose \`release\` to promote. If it is the last, choose \`done\`. A regression goes to \`build\`, and if users are impacted, say "rollback" in decisions.` : '',
+        `Environments: ${this.envs.join(' → ')}. If ${state.lastEnv} is healthy and it isn't the last environment, choose \`release\` to promote. If it is the last, choose \`done\`. A regression goes to \`build\`, and if users are impacted, say "rollback" in decisions.\n` +
+        `Only a defect this issue caused goes to \`build\`. A release-wide gap that this issue's design doesn't touch (a security header or CSP, gate evidence, compliance) is not its defect: choose \`release\`, name the issue that owns the gap, and say it holds production.` +
+        ((r) => r?.verdicts.length ? `\n\n## Already checked on this build${r.sha ? ` (${r.sha})` : ''}\nSRE verified other issues on the same deploy. Reuse release-wide results (health, listeners, headers) instead of re-deriving them, and rule the same way on the same gap:\n${r.verdicts.map((t) => `- #${t.issue} → \`${t.to}\`: ${String(t.summary ?? '').replace(/\s+/g, ' ').slice(0, 300)}`).join('\n')}` : '')(rulingsOn(M.events({ since: new Date(Date.now() - 864e5).toISOString() }), state.lastEnv)) : '',
       `\n## How to work`,
       `This brief already holds the digest, the product brief, the answers, the issue's comments and history, and the earlier artifacts. ` +
         `Don't re-read them or re-run \`gh issue view\` and \`sf memory issue\`. Spend your steps on the work itself; read the full documents only for a specific gap.`,

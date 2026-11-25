@@ -115,3 +115,25 @@ test('#83: a dependency whose code has merged is not waited on again', async () 
   assert.deepEqual(pendingDeps([4], of), [], 'merged code: the wait is over');
   assert.deepEqual(pendingDeps([4, 7, 9], of), [7, 9], 'unmerged ones are still waited on');
 });
+
+// #180/#182 (COE on #6): verify bounced #6 to build over the release-wide CSP header; its design says csp=n.
+test('#6: a verify bounce over the release-wide CSP header is not the issue\'s defect when its design says csp=n', async () => {
+  const { touchesOf, offScopeCsp, rulingsOn } = await import('../factory/lib/dispatcher.mjs');
+  assert.deepEqual(touchesOf('Risk tier: medium\nTouches: ui=y storage=y schemaVersion 2→3 csp=n\n'), { ui: true, storage: true, csp: false });
+  assert.deepEqual(touchesOf('no header'), { ui: null, storage: null, csp: null });
+  const bounce = { summary: "Staging is healthy, but I can't verify it because no CSP is served and deploy/csp.txt doesn't exist." };
+  assert.equal(offScopeCsp(bounce, { csp: false }, 'build'), true);
+  assert.equal(offScopeCsp(bounce, { csp: true }, 'build'), false, 'an issue that owns CSP is sent back');
+  assert.equal(offScopeCsp(bounce, { csp: null }, 'build'), false, 'unknown scope: leave it to the verdict');
+  assert.equal(offScopeCsp({ summary: 'No CSP served, and the pay button regressed: 500 on submit.' }, { csp: false }, 'build'), false, 'a real regression still goes to build');
+  assert.equal(offScopeCsp(bounce, { csp: false }, 'release'), false);
+  const evs = [
+    { ts: '2026-11-25T17:10:00Z', type: 'transition', stage: 'verify', issue: 1, to: 'build', summary: 'before this deploy' },
+    { ts: '2026-11-25T17:17:32Z', type: 'deploy', env: 'staging', ok: true, log: '── deploy enwallet@144e4de → staging' },
+    { ts: '2026-11-25T17:18:45Z', type: 'transition', stage: 'verify', issue: 3, to: 'release', summary: 'No CSP; #27 owns it.' },
+  ];
+  const r = rulingsOn(evs, 'staging');
+  assert.equal(r.sha, '144e4de');
+  assert.deepEqual(r.verdicts.map((t) => t.issue), [3], 'only rulings on the deployed build');
+  assert.equal(rulingsOn(evs, 'production'), null);
+});
