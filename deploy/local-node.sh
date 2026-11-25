@@ -10,6 +10,7 @@ set -euo pipefail
 umask 077 # [S4] deploy.log, server.log, server.pid, releases/ and data/ are owner-only.
 
 LOG="" step=args tmp="" off=0
+here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 log() { printf '%s\n' "$*"; if [[ -n $LOG ]]; then printf '%s\n' "$*" >>"$LOG"; fi; }
 die() { local code=$1; shift; log "$*"; exit "$code"; }
 q() { printf '%q' "$1"; } # [S1] rejected values are always shell-quoted.
@@ -169,11 +170,21 @@ npm ci --ignore-scripts --no-audit --no-fund --loglevel=error 2>&1 | tee -a "$LO
 npm run build --loglevel=error 2>&1 | tee -a "$LOG"
 [[ -f dist/index.html ]] || die 1 "✗ missing precondition: dist/index.html"
 
-step=copy; tmp="$R/releases/.tmp-$sha-$$"; log "· copy dist, server, src/shared → releases/$sha"
+step=copy; tmp="$R/releases/.tmp-$sha-$$"; log "· copy dist, server, src/shared, src/brand → releases/$sha"
 mkdir -- "$tmp"
 cp -R dist server "$tmp/"
-if [[ -d src/shared ]]; then mkdir -- "$tmp/src"; cp -R src/shared "$tmp/src/"; fi
+for d in shared brand; do
+  if [[ -d src/$d ]]; then mkdir -p -- "$tmp/src"; cp -R "src/$d" "$tmp/src/"; fi
+done
 touch "$tmp"
+# [#53] Every relative import in server/, src/shared/ and src/brand/ must resolve inside the staged release.
+# Runs before guard_port/stop_ours/rm/mv, so a failure leaves the live release untouched.
+step=closure
+if ! out=$(node "$here/check-import-closure.mjs" "$tmp"); then
+  if [[ -n $out ]]; then while IFS= read -r l; do log "$l"; done <<<"$out"; fi
+  rm -rf -- "$tmp"; tmp=""
+  die 1 "✗ import closure check failed for $name@$sha; nothing switched"
+fi
 
 prev=$(readlink "$R/current" 2>/dev/null || true); prev=${prev##*/}
 valid_id "$prev" && [[ -d $R/releases/$prev && $prev != "$sha" ]] || prev=""
