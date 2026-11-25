@@ -54,10 +54,16 @@ export async function sync(cfg) {
   const seen = M.kv('answers-sync');
   let n = 0;
   for (const label of ['sf-vendor-request', 'sf-owner-request']) {
-    const list = await T.gh(['issue', 'list', '-R', cfg.product.tracker, '--state', 'all', '--label', label, '--limit', '100', '--json', 'number,title,comments'])
+    const list = await T.gh(['issue', 'list', '-R', cfg.product.tracker, '--state', 'all', '--label', label, '--limit', '100', '--json', 'number,title,comments,state,stateReason,closedAt'])
       .then((o) => JSON.parse(o || '[]')).catch(() => []);
     for (const i of list) {
       const human = (i.comments ?? []).filter((c) => !c.body.includes(T.MARK) && !/^\*\*Also requested\*\*/.test(c.body) && c.createdAt > (seen[i.number] ?? ''));
+      // Closed with no comment still answers it (owner request #155): "assumed until #N" lines go stale when #N closes.
+      if (!human.length && i.state === 'CLOSED' && !seen[i.number] && i.closedAt) {
+        record({ n: i.number, title: i.title, text: `Closed as ${String(i.stateReason || 'completed').toLowerCase().replace('_', ' ')} without a comment.`, by: 'owner', at: i.closedAt });
+        seen[i.number] = i.closedAt; n++;
+        continue;
+      }
       if (!human.length) continue;
       record({ n: i.number, title: i.title, text: human.map((c) => c.body).join('\n\n'), by: human.at(-1).author?.login ?? 'owner', at: human.at(-1).createdAt });
       seen[i.number] = human.at(-1).createdAt; n++;

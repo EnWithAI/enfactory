@@ -62,9 +62,10 @@ quality:
         doc,
         contract,
         compliance,
-        policy
+        policy,
+        security
       ]
-    verify: [ unit, property, integration, e2e, axe, device, doc ]
+    verify: [ unit, property, integration, e2e, axe, device, doc, deployed ]
 
 # Delivery. Agile releases: one release at a time, each ending in one demoable piece. The product owner plans it,
 # only its issues move past triage, and it closes with release notes, a demo and a retrospective.

@@ -307,10 +307,12 @@ const commands = {
     // sf lint build <issue>  → the checks declared on build (the AC → evidence table), against its build.md
     const [kind, n] = rest;
     const stage = { spec: 'feature-grooming', build: 'build', design: 'tech-grooming' }[kind];
-    if (!stage || !n) throw new Error('usage: sf lint spec|build|design <issue> [--stdin]');
+    if (!stage || !n) throw new Error('usage: sf lint spec|build|design <issue> [--file <draft.md> | --stdin]');
     const C = await import('./lib/checks.mjs'), cfg = loadConfig();
     const checks = cfg.pipeline[stage]?.checks ?? { build: ['ac_evidence'], 'tech-grooming': ['design_lint'] }[stage] ?? ['spec_lint'];
-    const r = has('stdin') // lint a draft before handing it in: sf lint spec <n> --stdin < draft.md
+    // A draft before handing it in: --file <path> (works where pipes are denied, owner request #156) or --stdin < draft.md
+    const r = flag('file') ? C.runChecks(checks, readFileSync(flag('file'), 'utf8'), cfg, { issue: Number(n) })
+      : has('stdin')
       ? C.runChecks(checks, await new Promise((res) => { let b = ''; process.stdin.on('data', (d) => (b += d)).on('end', () => res(b)); }), cfg, { issue: Number(n) })
       : C.lintIssue(Number(n), stage, cfg);
     console.log(r.ok ? `✓ #${n} ${kind} passes` : `✗ #${n} ${kind}: ${r.failures.length} problem(s)\n${r.failures.map((f) => `  - ${f}`).join('\n')}`);

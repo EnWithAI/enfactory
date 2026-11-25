@@ -743,7 +743,7 @@ export class Dispatcher {
     }
     // An advance whose every AC is already satisfied builds nothing: flag it for the weekly report (owner request #145).
     if (v.outcome === 'advance') { const acLines = (v.artifact_markdown ?? '').split('\n').filter((l) => /\bAC-\d+-\w+/.test(l)); if (acLines.length && acLines.every((l) => /already (satisfied|holds|on main|in place)/i.test(l))) M.record('noop_advance', { stage, to: next, acs: acLines.length }, { actor: role, issue: n }); }
-    M.record('transition', { stage, to: next, outcome: v.outcome, loop: isLoop, loops: state.loops, summary: v.summary,
+    M.record('transition', { stage, to: next, outcome: v.outcome, loop: isLoop, loops: state.loops, summary: v.summary, ...(isLoop ? { loop_cause: v.loop_cause ?? null, origin_stage: v.origin_stage ?? null } : {}),
       artifact, adrs, cost_usd: res.cost, council: fromCouncil }, { actor: role, issue: n });
 
     await T.comment(repo, n, [
@@ -767,7 +767,12 @@ export class Dispatcher {
         await T.comment(repo, n, `### ↩️ Not published: ${v.question_for_human}\nBack to \`tech-grooming\` to declare it.`);
         return this.move(issue, stage, 'tech-grooming', state);
       }
-      else next = 'blocked';
+      else { // build handed in, but no commits anywhere: alert the owner, with no council and no loop (owner request #154)
+        M.record('no_pr_alert', { summary: v.summary?.slice(0, 300), repos: this.touched(state).map((r) => r.name) }, { actor: role, issue: n });
+        return this.escalate(n, state, 'build', `**Build handed in, but there is no PR anywhere.** ${v.question_for_human ?? ''} The engineer reported done, ` +
+          `yet none of ${this.touched(state).map((r) => r.repo).join(', ') || 'the declared repos'} has commits on sf/issue-${n}. ` +
+          `Reply with what to do (re-run the build, or close the issue if the work is already done), then approve.`, owners(cfg));
+      }
     }
     if (['review', 'security'].includes(stage)) {
       for (const [name, pr] of Object.entries(state.prs ?? {})) {
@@ -1516,7 +1521,7 @@ export class Dispatcher {
       ...this.repos.map((r) => `- ${p('memory/product/repos', `${r.name}.md`)}: ${r.name} (${r.repo})`),
       dossier.artifacts.length ? `- Every artifact (older versions too): ${dossier.artifacts.map((a) => p(a)).join(', ')}` : '',
       `- \`sf recall "<keywords>"\` for decisions and learnings from other issues.`,
-      st.workspace ? `\n## Workspace (cwd: ${cwd})\nOne sub-folder per repo, each a git worktree on branch \`sf/issue-${n}\`:\n${this.touched(state).map((r) => `- \`${r.name}/\`: ${r.repo} (base \`origin/${r.default_branch}\`)`).join('\n')}\nOnly change repos the tech design names. If another repo must change, loop back to tech-grooming.` : '',
+      st.workspace ? `\n## Workspace (cwd: ${cwd})\nOne sub-folder per repo, each a git worktree on branch \`sf/issue-${n}\`:\n${this.touched(state).map((r) => `- \`${r.name}/\`: ${r.repo} (base \`origin/${r.default_branch}\`)`).join('\n')}\nOnly change repos the tech design names. If another repo must change, loop back to tech-grooming.${state.factory?.paths?.length ? ` Factory commits end with the trailer \`Issue: ${repo}#${n}\`, so the factory repo's history links each change to its issue.` : ''}` : '',
       stage === 'release' ? `\n## Go-live policy\n${cfg.release.policy}\nEnvironments in order: ${this.envs.join(' → ')}. Already deployed: ${JSON.stringify(state.deployed ?? {})}. The next one is **${this.nextEnv(state)}**.${Object.keys(state.noRuntime ?? {}).length ? ` Passed with no runtime surface: ${JSON.stringify(state.noRuntime)}.` : ''}\n` +
         `Deploy config for ${this.nextEnv(state)}:\n${this.deployable(state).map((r) => `- ${r.name}: deploy ${r.deploy_command ? `\`${r.deploy_command}\` (resolves: ${this.resolvesProgram(deployProgram(r.deploy_command), r) ? 'yes' : 'no'})` : r.deploy_workflow || '(none configured)'}, health ${r.health?.[this.nextEnv(state)] || '(none configured)'}`).join('\n')}\n` +
         `The dispatcher marks the environment deployed only if every repo's deploy exits 0 and its health URL answers 200; otherwise the release is held whatever you choose. ` +

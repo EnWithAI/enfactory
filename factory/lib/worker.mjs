@@ -29,6 +29,10 @@ export function verdictSchema(nextOptions, extra = {}) {
     type: 'object',
     properties: {
       outcome: { enum: ['advance', 'loop_back', 'reject', 'blocked', 'needs_vendor', 'wait', 'already_satisfied'] },
+      // One loop-back classification (governance decision, owner request #155): why work went back, and where the defect began.
+      loop_cause: { enum: ['requirement', 'design', 'code', 'test', 'premise', 'format', 'environment', 'dependency', 'other'],
+        description: 'With outcome loop_back: the kind of defect that sends this back.' },
+      origin_stage: { type: 'string', description: 'With outcome loop_back: the stage where the defect was introduced (e.g. feature-grooming).' },
       satisfied_by: { type: 'string', description: 'With outcome `already_satisfied`: the evidence that the work is already done, as file:lines or a commit sha. ' +
         'The product owner confirms and the issue closes as completed, with nothing built.' },
       wait_for: { type: 'array', items: { type: 'number' }, description: 'With outcome `wait`: the issue numbers this one depends on, as the plan already says. ' +

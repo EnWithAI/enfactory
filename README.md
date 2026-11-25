@@ -57,6 +57,21 @@ The dashboard walks you through the rest. You don't need any other commands:
 the factory versions them in a separate local repo (`.memory.git`), so a `git pull` for factory updates never touches your data.
 New installs start from `templates/org/`.
 
+**Memory history is local only.** `.memory.git` commits every change to memory, config and documents, but it has no remote, so
+it lives and dies with this computer. For an audit trail that survives the machine (fintech clients will ask), give it a
+**private** remote that only you can read, and push it regularly:
+
+```bash
+git --git-dir=.memory.git --work-tree=. remote add origin git@github.com:<you>/<install>-memory.git   # a PRIVATE repo
+git --git-dir=.memory.git --work-tree=. push -u origin HEAD
+```
+
+Memory holds client requirements, decisions and the ledger. Never point it at a public repo or at the factory's code repo.
+
+**CI for the factory itself.** `.github/workflows/ci.yml` runs on every PR to the factory: the tests, `npm audit`, `bash -n`,
+shellcheck and a gitleaks history scan, on macOS, with a read-only token and actions pinned to commits. Factory changes from the
+pipeline merge only with the owner's approval; CI gives that approval evidence instead of pasted output.
+
 Scoped tool permissions in `org/org.yaml` use `{FACTORY}` for the install folder (for example `Write(/{FACTORY}/memory/specs/*/verify.md)`),
 so the same config works on any machine.
 

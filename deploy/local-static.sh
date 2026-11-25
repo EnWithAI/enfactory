@@ -7,7 +7,7 @@ name=${1:-} env=${2:-} port=${3:-}
 # Validate inputs before touching the filesystem (governance owner request #25).
 [[ "$name" =~ ^[a-z0-9-]+$ ]] || { echo "✗ invalid repo name: '$name' (expected ^[a-z0-9-]+$)"; exit 2; }
 [[ "$env" == staging || "$env" == production ]] || { echo "✗ invalid environment: '$env' (expected staging or production)"; exit 2; }
-[[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1024 && port <= 65535 )) || { echo "✗ invalid port: '$port' (expected an integer 1024-65535)"; exit 2; }
+if ! { [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1024 && port <= 65535 )); }; then echo "✗ invalid port: '$port' (expected an integer 1024-65535)"; exit 2; fi
 root="${SF_ENV_ROOT:-$HOME/factory-envs}/$name/$env"
 mkdir -p "$root/releases"
 exec > >(tee -a "$root/deploy.log") 2>&1
@@ -16,6 +16,7 @@ exec > >(tee -a "$root/deploy.log") 2>&1
 if [[ "${4:-}" == "--rollback" ]]; then
   cur=$(basename "$(readlink "$root/current" 2>/dev/null)" 2>/dev/null || true)
   target=$(cat "$root/VERIFIED" 2>/dev/null || true)
+  # shellcheck disable=SC2010 # newest-first order is the point; release names are short git shas
   [[ -z "$target" || "$target" == "$cur" ]] && target=$(ls -1t "$root/releases" | grep -vx "$cur" | head -1 || true)
   [[ -z "$target" || ! -d "$root/releases/$target" ]] && { echo "✗ no release to roll back to"; exit 1; }
   ln -sfn "$root/releases/$target" "$root/current" && echo "$target" >"$root/VERSION"
@@ -59,6 +60,7 @@ healthy() {
 for _ in $(seq 1 10); do
   if healthy; then
     echo "$sha" >"$root/VERSION"
+    # shellcheck disable=SC2012 # newest-first order is the point; release names are short git shas
     ls -1t "$root/releases" | tail -n +6 | while read -r old; do rm -rf "$root/releases/$old"; done
     echo "✓ $name@$sha live on $env at $url"
     exit 0

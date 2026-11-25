@@ -63,10 +63,17 @@ export function specLint(md, cfg) {
   // Premises: a vendor or owner request the owner has answered must not be cited as pending (owner request #22)
   const answered = answeredRequests();
   for (const l of md.split('\n')) {
-    for (const [, n] of l.matchAll(/(?:vendor|owner)?\s*(?:request\s*)?#(\d+)/gi)) {
-      const ans = answered.get(Number(n));
-      if (ans && /(pending|open|awaiting|until|unresolved|not yet answered|tbd)/i.test(l)) failures.push(`cites #${n} as pending, but the owner answered it: "${ans.replace(/\s+/g, ' ').slice(0, 120)}". Update the premise.`);
-    }
+    // Each #N is judged by its own clause, from the previous #M (or 40 characters back) to the next #M or a clause break,
+    // so "#9 answered; #61 pending" doesn't flag #9 (owner request #156).
+    const refs = [...l.matchAll(/(?:vendor|owner)?\s*(?:request\s*)?#(\d+)/gi)];
+    refs.forEach((m, k) => {
+      const ans = answered.get(Number(m[1]));
+      if (!ans) return;
+      const from = k ? refs[k - 1].index + refs[k - 1][0].length : Math.max(0, m.index - 40);
+      let clause = l.slice(from, k + 1 < refs.length ? refs[k + 1].index : l.length);
+      clause = clause.split(/[;|]|\.\s/).find((c) => c.includes(`#${m[1]}`)) ?? clause;
+      if (/(pending|open|awaiting|until|unresolved|not yet answered|tbd)/i.test(clause)) failures.push(`cites #${m[1]} as pending, but the owner answered it: "${ans.replace(/\s+/g, ' ').slice(0, 120)}". Update the premise.`);
+    });
   }
   const trace = md.split('\n').filter((l) => /AC-\d+-/.test(l) && /US-\d+|`[^`]+`/.test(l) && !list.some((a) => a.line === l)); // §4a-style trace rows
   const thenText = list.map((a) => (a.text.split(/\*{0,2}then\*{0,2}/i).slice(1).join(' ') || a.text)).join('\n');

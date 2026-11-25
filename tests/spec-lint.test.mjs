@@ -38,3 +38,11 @@ test('v3 passes', () => {
   const r = specLint(fixture('v3'), cfg);
   assert.deepEqual(r.failures.filter(predates134), []);
 });
+
+// Owner request #156: on a line naming several issues, "pending" belongs to its own issue's clause, not to every #N on the line.
+test('the premise rule judges each #N by its own clause', () => {
+  const spec = '# Spec\n## 3. Acceptance criteria\n- **AC-9-01** Given x, When `grep -c y f` runs, Then 1. [verify: doc] [family: doc]\n\n' +
+    'Premises: vendor request #9 is answered (laptop staging); owner request #999999 is still pending.\n';
+  const r = specLint(spec, cfg);
+  assert.ok(!r.failures.some((f) => /cites #9 as pending/.test(f)), 'the answered #9 is not blamed for #999999 being pending');
+});
