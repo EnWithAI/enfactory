@@ -165,7 +165,7 @@ export function handoffFor(h, stage, cfg) {
   return { kind: 'loop', title: `What must change (from ${h.by}, ${h.from})`, text: h.text };
 }
 // Faults in the harness or the account, not the agent's work: retried, never escalated, never a COE.
-const INFRA = /agents file changed|ENOENT|EAGAIN|ECONNRESET|overloaded|rate.?limit|session limit|usage limit|spawn |^exit (137|143)$|SIGTERM|SIGKILL|connection reset|i\/o timeout|timed out|EAI_AGAIN|ETIMEDOUT|ENOTFOUND|api\.github\.com|HTTP 50[0-9]|502 Bad Gateway|503 Service|not logged in|please run \/login|invalid api key|oauth token|authentication_error|gh auth login/i; // incl. runs killed by a stop or restart, network/GitHub outages, and a logged-out Claude or gh
+const INFRA = /agents file changed|ENOENT|EAGAIN|ECONNRESET|overloaded|rate.?limit|session limit|usage limit|spawn |^exit (137|143)$|SIGTERM|SIGKILL|connection reset|i\/o timeout|timed out|EAI_AGAIN|ETIMEDOUT|ENOTFOUND|api\.github\.com|HTTP 50[0-9]|502 Bad Gateway|503 Service|Something went wrong while executing your query|status code: 50[0-9]|not logged in|please run \/login|invalid api key|oauth token|authentication_error|gh auth login/i; // incl. runs killed by a stop or restart, network/GitHub outages, and a logged-out Claude or gh
 
 function INCIDENT() {
   return { type: 'object', properties: { title: { type: 'string' }, severity: { enum: ['P0', 'P1', 'P2', 'P3'] },
