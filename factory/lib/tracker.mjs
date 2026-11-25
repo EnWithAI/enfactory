@@ -137,12 +137,25 @@ export async function prCheckList(repo, pr) {
   catch (e) { if (/no checks/i.test(e.stderr ?? '')) return []; if (!e.stdout) throw e; out = e.stdout; }
   return JSON.parse(out || '[]');
 }
-/** The failing steps' log lines for a failed check, from its Actions run (tail only: that's where the error is). */
+/** The failing steps' log lines for a failed check (tail only: that's where the error is). The job's own log comes first:
+ *  `gh run view --log-failed` refuses while other jobs in the run are still going, which left #6's engineer an empty excerpt. */
 export async function failedLog(repo, check, lines = 60) {
-  const run = String(check.link ?? '').match(/\/actions\/runs\/(\d+)/)?.[1];
+  const link = String(check.link ?? '');
+  const job = link.match(/\/job\/(\d+)/)?.[1];
+  if (job) {
+    const log = await gh(['api', `repos/${repo}/actions/jobs/${job}/logs`]).catch(() => '');
+    if (log.trim()) return errorTail(log, lines);
+  }
+  const run = link.match(/\/actions\/runs\/(\d+)/)?.[1];
   if (!run) return '';
   const log = await gh(['run', 'view', run, '-R', repo, '--log-failed']).catch(() => '');
   return log.split('\n').slice(-lines).join('\n');
+}
+/** The lines up to the last `##[error]` (post-job cleanup after it is noise), timestamps stripped. */
+export function errorTail(log, lines = 60) {
+  const all = log.split('\n').map((l) => l.replace(/^﻿?\d{4}-\d\d-\d\dT[\d:.]+Z /, ''));
+  const err = all.findLastIndex((l) => l.includes('##[error]'));
+  return all.slice(0, err >= 0 ? err + 1 : all.length).slice(-lines).join('\n');
 }
 export async function prMergeable(repo, pr) {
   const { mergeable } = await json(['pr', 'view', String(pr), '-R', repo, '--json', 'mergeable']);
