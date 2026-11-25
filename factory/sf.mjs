@@ -306,18 +306,25 @@ const commands = {
     // sf lint spec <issue>   → the checks declared on feature-grooming, against that issue's spec
     // sf lint build <issue>  → the checks declared on build (the AC → evidence table), against its build.md
     const [kind, n] = rest;
-    const stage = { spec: 'feature-grooming', build: 'build' }[kind];
-    if (!stage || !n) throw new Error('usage: sf lint spec|build <issue> [--stdin]');
+    const stage = { spec: 'feature-grooming', build: 'build', design: 'tech-grooming' }[kind];
+    if (!stage || !n) throw new Error('usage: sf lint spec|build|design <issue> [--stdin]');
     const C = await import('./lib/checks.mjs'), cfg = loadConfig();
-    const checks = cfg.pipeline[stage]?.checks ?? (stage === 'build' ? ['ac_evidence'] : ['spec_lint']);
+    const checks = cfg.pipeline[stage]?.checks ?? { build: ['ac_evidence'], 'tech-grooming': ['design_lint'] }[stage] ?? ['spec_lint'];
     const r = has('stdin') // lint a draft before handing it in: sf lint spec <n> --stdin < draft.md
       ? C.runChecks(checks, await new Promise((res) => { let b = ''; process.stdin.on('data', (d) => (b += d)).on('end', () => res(b)); }), cfg, { issue: Number(n) })
       : C.lintIssue(Number(n), stage, cfg);
     console.log(r.ok ? `✓ #${n} ${kind} passes` : `✗ #${n} ${kind}: ${r.failures.length} problem(s)\n${r.failures.map((f) => `  - ${f}`).join('\n')}`);
+    if (r.warnings?.length) console.log(`! ${r.warnings.length} warning(s)\n${r.warnings.map((w) => `  - ${w}`).join('\n')}`);
     if (!r.ok) process.exitCode = 1;
   },
 
   async recall() {
+    // sf recall --path deploy/local-node.sh → which open issues claim that file (owner request #115)
+    if (flag('path')) {
+      const D = await import('./lib/dispatcher.mjs'), x = flag('path').replace(/^\.?\//, '');
+      const c = D.clashes(0, [x], D.claimsIndex());
+      return console.log(c.length ? c.map((m) => `#${m.issue} claims ${m.path}`).join('\n') : `No open issue claims ${x}.`);
+    }
     for (const h of M.recall(positional, Number(flag('limit', 15)))) console.log(`── ${h.file}\n${h.text}\n`);
   },
   async memory() {

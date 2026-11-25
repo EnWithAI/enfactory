@@ -70,6 +70,9 @@ When acting:
   must ship as a separate PR, file it as a follow-up issue. The dispatcher publishes the worktree's HEAD as the issue's PR.
 - If you need an answer from one specialist (for example security on an ADR), use `consult` with outcome `blocked`. That is one run of that role,
   not a council.
+- A change to the factory's own code (deploy scripts, factory/lib, templates) is declared in tech-grooming as `factory_paths`, never as a repo.
+  The engineer gets a factory worktree on the issue branch; it is reviewed and security-checked, never deployed, and merges only with the owner's
+  approval. Never edit the running factory directly. `org/`, `memory/` and `library/` are this install's data: change them through `process_proposal`.
 
 ## Using the shell
 - Run one simple command per Bash call, with absolute paths. Don't chain commands (`;`, `&&`, `|`) or `cd` first: permissions

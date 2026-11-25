@@ -154,23 +154,41 @@ export function acEvidence(md, cfg, { issue = null } = {}) {
   return { ok: !failures.length, failures };
 }
 
-export const CHECKS = { spec_lint: specLint, ac_evidence: acEvidence };
+/**
+ * design_lint (owner request #100, COE on #5): a tech design states what a revision changed and which repo invariants it
+ * keeps; numeric limits in §5 come with their arithmetic. The last is a warning, not a failure.
+ */
+export function designLint(md, cfg, { issue = null } = {}) {
+  const failures = [], warnings = [];
+  const revision = issue && existsSync(p('memory/specs', `issue-${issue}`, 'tech-grooming.v1.md'));
+  if (revision && !/^#{1,4}\s.*delta impact/im.test(md)) failures.push('This is a revision of the design: add a "Delta impact" section saying what changed since the last version and what it affects.');
+  if (!/^#{1,4}\s.*repo invariants honou?red/im.test(md)) failures.push('Add a "Repo invariants honoured" section: the invariants from the repo docs this design keeps (or the ADR that changes one).');
+  const lines = md.split('\n'), s5 = lines.findIndex((l) => /^#{2,4}\s*§?5\b/.test(l));
+  if (s5 >= 0) for (let i = s5 + 1; i < lines.length && !/^#{2,4}\s/.test(lines[i]); i++) {
+    if (/^\s*\|/.test(lines[i]) && /\d+[- ](code[- ]?points?|chars?|characters?|emoji|bytes?|digits?|ms|seconds?)\b/i.test(lines[i]) && !/[=≤≥<>]/.test(lines[i]))
+      warnings.push(`§5 line ${i + 1} states a numeric boundary without its arithmetic (=, ≤): "${lines[i].trim().slice(0, 90)}"`);
+  }
+  return { ok: !failures.length, failures, warnings };
+}
+
+export const CHECKS = { spec_lint: specLint, ac_evidence: acEvidence, design_lint: designLint };
 
 /** Run a stage's declared checks against its artifact. `ctx.issue` lets a check read the issue's other artifacts. */
 export function runChecks(names, md, cfg, ctx = {}) {
-  const failures = [];
+  const failures = [], warnings = [];
   for (const name of names ?? []) {
     const fn = CHECKS[name];
     if (!fn) { failures.push(`unknown check "${name}"`); continue; }
     const r = fn(md, cfg, ctx);
     if (!r.ok) failures.push(...r.failures.map((f) => `[${name}] ${f}`));
+    warnings.push(...(r.warnings ?? []).map((w) => `[${name}] ${w}`));
   }
-  return { ok: !failures.length, failures };
+  return { ok: !failures.length, failures, warnings };
 }
 
 /** For the CLI: lint the current artifact of a stage for an issue. */
 export function lintIssue(n, stage, cfg) {
   const f = p('memory/specs', `issue-${n}`, `${stage}.md`);
   if (!existsSync(f)) throw new Error(`no ${stage} artifact for #${n}`);
-  return runChecks(cfg.pipeline[stage]?.checks ?? (stage === 'build' ? ['ac_evidence'] : ['spec_lint']), readFileSync(f, 'utf8'), cfg, { issue: n });
+  return runChecks(cfg.pipeline[stage]?.checks ?? { build: ['ac_evidence'], 'tech-grooming': ['design_lint'] }[stage] ?? ['spec_lint'], readFileSync(f, 'utf8'), cfg, { issue: n });
 }

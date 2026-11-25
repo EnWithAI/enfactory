@@ -1227,7 +1227,7 @@ function renderFeed(s) {
 let boardSig = '';
 function renderBoard(s) {
   const items = s.issues.filter((i) => !['done', 'rejected', 'closed'].includes(i.stage));
-  const sig = JSON.stringify(items.map((i) => [i.n, i.stage, i.working, i.waiting, i.vendor, i.backlog, i.risk, i.loops, Math.round(i.cost * 100), i.last?.slice(0, 80)]));
+  const sig = JSON.stringify(items.map((i) => [i.n, i.stage, i.working, i.waiting, i.vendor, i.backlog, i.risk, i.loops, Math.round(i.cost * 100), i.last?.slice(0, 80), JSON.stringify([i.gates, i.gateFailed, i.gateKept])]));
   if (sig === boardSig) return;
   boardSig = sig;
   keepFocus($('board'), ['data-issue'], () => $('board').replaceChildren(...(items.length ? items.map((i) => el('div', { class: `card${i.working ? ' active' : ''}`, tabindex: '0', 'data-issue': i.n,
@@ -1248,6 +1248,9 @@ function renderBoard(s) {
       } }, 'Pull into release') : null,
       i.risk ? el('span', { class: 'pill' }, `risk ${i.risk}`) : null,
       i.loops ? el('span', { class: 'pill warn' }, `${i.loops} loop${i.loops > 1 ? 's' : ''}`) : null,
+      // The issue's cut line (owner request #105): its gate, red once it has failed, until the product owner cuts or keeps it.
+      i.gates ? el('span', { class: `pill ${i.gateFailed ? 'err' : i.gateKept ? 'info' : ''}`, title: i.gateFailed ? `Gate failed: ${i.gateFailed.reason}. No work starts; the product owner decides the cut.` : i.gateKept ? `Kept past its gate by the product owner: ${i.gateKept.reason}` : 'This issue stops if its gate fails' },
+        `${i.gateFailed ? 'cut line passed' : i.gateKept ? 'kept past cut line' : 'cut line'}: ${[i.gates.spend_usd_max != null ? `$${i.gates.spend_usd_max}` : '', i.gates.not_after ? new Date(i.gates.not_after).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : ''].filter(Boolean).join(' · ')}`) : null,
       el('span', { class: 'pill' }, `$${i.cost.toFixed(2)}`)),
     i.last ? el('div', { class: 's' }, i.last) : null)) : [el('div', { class: 'muted' }, 'No open issues in the factory yet.')])));
 }

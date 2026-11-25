@@ -360,6 +360,7 @@ pipeline:
       org/ or script edit as an explicit AC or a follow_up_issue in the same
       verdict (OM-10.7).
     next: [ build, feature-grooming, design ]
+    checks: [ design_lint ] # "Repo invariants honoured" always, "Delta impact" on revisions; owner request #100
   build:
     role: engineer
     workspace: true
@@ -598,6 +599,7 @@ economy:
     - { task: engage-requirements, model: claude-sonnet-5-5, budget_usd: 1 }
     - { task: digest, model: claude-sonnet-5-5, budget_usd: 2 }
     - { task: feedback-review, model: claude-sonnet-5-5, effort: medium, budget_usd: 1.5 }
+    - { task: cut-, model: claude-sonnet-5-5, effort: medium, budget_usd: 1 }
     - { task: observe, effort: low, budget_usd: 0.5 }
     - { task: analysis, budget_usd: 1 }
     - { task: design, budget_usd: 2.5 }

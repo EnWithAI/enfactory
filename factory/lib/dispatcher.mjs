@@ -1,11 +1,11 @@
 import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, appendFileSync } from 'node:fs';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { HOME, p, loadConfig, headcount, STAGE_ORDER, teamOf, holderOf, vendors, owners } from './config.mjs';
 import * as T from './tracker.mjs';
 import * as M from './memory.mjs';
-import { runAgent, verdictSchema } from './worker.mjs';
+import { runAgent, verdictSchema, DECISION } from './worker.mjs';
 import { council } from './council.mjs';
 import { report } from './report.mjs';
 import * as R from './repos.mjs';
@@ -14,8 +14,96 @@ import { decideDeploy, probeHealth } from './deploy-gate.mjs';
 
 const now = () => new Date();
 const sh = promisify(execFile);
+
+/**
+ * The factory's own code repo, as a repo the pipeline can work in (feedback 21182531): from this install's git remote.
+ * Engineers work in a separate clone of it under workspaces/, never in the running factory. null when there is no remote.
+ */
+export function factoryRepo() {
+  try {
+    const url = execFileSync('git', ['-C', HOME, 'remote', 'get-url', 'origin'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    const slug = url.match(/github\.com[:/]([^/]+\/[^/]+?)(\.git)?$/)?.[1];
+    const branch = execFileSync('git', ['-C', HOME, 'symbolic-ref', '--short', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() || 'main';
+    return slug ? { name: 'software-factory', repo: slug, default_branch: branch, factory: true, about: 'The factory itself' } : null;
+  } catch { return null; }
+}
+/**
+ * An issue's gate (owner request #105), from lines in its body: `spend_usd_max: 60` (the current release's agent spend, or
+ * today's outside a release) and `not_after: 2026-11-25T21:30+05:30` (or `21:30`, today, local time). null when it has none.
+ */
+export function parseGates(body, today = new Date()) {
+  const text = String(body ?? '');
+  const spend = text.match(/spend_usd_max\s*[:=]\s*\$?\s*(\d+(?:\.\d+)?)/i)?.[1];
+  const after = text.match(/not_after\s*[:=]\s*`?([0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9:.]+(?:Z|[+-][0-9]{2}:?[0-9]{2})?|[0-9]{1,2}:[0-9]{2})`?/i)?.[1];
+  let notAfter = null;
+  if (after) {
+    if (/^\d{1,2}:\d{2}$/.test(after)) { const [h, m] = after.split(':').map(Number); const d = new Date(today); d.setHours(h, m, 0, 0); notAfter = d.toISOString(); }
+    else if (!Number.isNaN(Date.parse(after))) notAfter = new Date(after).toISOString();
+  }
+  return spend || notAfter ? { spend_usd_max: spend ? Number(spend) : null, not_after: notAfter } : null;
+}
+/** Does the gate still hold? spend is { release_usd, today_usd, release } from spend.json. */
+export function checkGate(gates, spend, inRelease, at = new Date()) {
+  if (!gates) return { ok: true };
+  const used = inRelease && spend?.release ? spend.release_usd : spend?.today_usd;
+  if (gates.spend_usd_max != null && used != null && used >= gates.spend_usd_max)
+    return { ok: false, reason: `spend $${used.toFixed(2)} has reached the gate of $${gates.spend_usd_max} (${inRelease && spend?.release ? `Release ${spend.release}` : 'today'})` };
+  if (gates.not_after && at >= new Date(gates.not_after)) return { ok: false, reason: `it is past the gate's deadline (${gates.not_after})` };
+  return { ok: true };
+}
+/**
+ * Where a `reject` verdict goes (owner request #104): 'close' where the stage may route to `rejected`, otherwise 'ask' the
+ * product owner, with `keepTo` the stage it continues to if kept. Never forward on the agent's say-so. null when not a cut.
+ */
+export function rejectRoute(stageNext, v, stage) {
+  if (v.outcome !== 'reject' || v.next_stage === 'rejected') return null;
+  if (stageNext.includes('rejected')) return { action: 'close' };
+  return { action: 'ask', keepTo: v.next_stage && v.next_stage !== 'blocked' ? v.next_stage : stage };
+}
+/**
+ * Is the change already on the default branch (owner request #122)? Each `done_when` check says a file contains a string exactly
+ * `count` times once the change is in. `read(repo, file)` returns the file's text or null. No shell: files are read, never run.
+ */
+export function freshness(checks, read) {
+  const results = checks.map((c) => {
+    const text = read(c.repo ?? null, c.file);
+    const found = text == null ? 0 : text.split(c.contains).length - 1;
+    return { ...c, found, holds: found === c.count };
+  });
+  return { allHold: results.length > 0 && results.every((r) => r.holds), results };
+}
+/** Do two declared paths overlap? Equal, or one is a folder holding the other. */
+const overlaps = (a, b) => a === b || a.startsWith(`${b.replace(/\/$/, '')}/`) || b.startsWith(`${a.replace(/\/$/, '')}/`);
+/**
+ * Which open issues already claim these paths (owner request #115)? index: { path: [issue, …] }. Pure, for the check and tests.
+ */
+export function clashes(n, paths, index) {
+  const out = [];
+  for (const x of paths) for (const [path, issues] of Object.entries(index)) for (const m of issues) if (m !== n && overlaps(x, path)) out.push({ issue: m, path, mine: x });
+  return out;
+}
+/** Rebuild memory/state/claims.json from every open issue's declared factory_paths. */
+export function claimsIndex() {
+  const dir = p('memory/state'), index = {};
+  for (const f of existsSync(dir) ? readdirSync(dir).filter((x) => /^issue-\d+\.json$/.test(x)) : []) {
+    const s = JSON.parse(readFileSync(`${dir}/${f}`, 'utf8')), n = Number(f.match(/\d+/)[0]);
+    if (s.closed) continue;
+    for (const x of s.factory?.paths ?? []) (index[x] ??= []).push(n);
+  }
+  writeFileSync(`${dir}/claims.json`, JSON.stringify(index, null, 2));
+  return index;
+}
+/** Paths a factory change may declare: code in the factory repo, not this install's data (org/, memory/, library/). */
+export function factoryPaths(paths) {
+  const ok = [], refused = [];
+  for (const raw of paths ?? []) {
+    const x = String(raw).trim().replace(/^\.?\//, '');
+    (x && !x.includes('..') && !/^(org|memory|library|workspaces|archive|\.factory|\.memory\.git|node_modules)(\/|$)/.test(x) ? ok : refused).push(x);
+  }
+  return { ok, refused };
+}
 // Faults in the harness or the account, not the agent's work: retried, never escalated, never a COE.
-const INFRA = /agents file changed|ENOENT|EAGAIN|ECONNRESET|overloaded|rate.?limit|session limit|usage limit|spawn |^exit (137|143)$|SIGTERM|SIGKILL|connection reset|i\/o timeout|timed out|EAI_AGAIN|ETIMEDOUT|ENOTFOUND|api\.github\.com|HTTP 50[0-9]|502 Bad Gateway|503 Service/i; // incl. runs killed by a stop or restart, and network/GitHub outages
+const INFRA = /agents file changed|ENOENT|EAGAIN|ECONNRESET|overloaded|rate.?limit|session limit|usage limit|spawn |^exit (137|143)$|SIGTERM|SIGKILL|connection reset|i\/o timeout|timed out|EAI_AGAIN|ETIMEDOUT|ENOTFOUND|api\.github\.com|HTTP 50[0-9]|502 Bad Gateway|503 Service|not logged in|please run \/login|invalid api key|oauth token|authentication_error|gh auth login/i; // incl. runs killed by a stop or restart, network/GitHub outages, and a logged-out Claude or gh
 
 function INCIDENT() {
   return { type: 'object', properties: { title: { type: 'string' }, severity: { enum: ['P0', 'P1', 'P2', 'P3'] },
@@ -32,6 +120,7 @@ export class Dispatcher {
     this.running = new Map(); // issue number -> { role, stage }
     this.queue = {}; // role -> { since, issues } work waiting for a seat
     this.background = new Set(); // COEs and other async org work; a graceful stop waits for these
+    this.factory = factoryRepo();
   }
 
   // Extra verdict fields some stages must return.
@@ -39,14 +128,26 @@ export class Dispatcher {
     const names = this.repos.map((r) => r.name);
     const pools = [...new Set((this.cfg.pipeline[stage]?.next ?? []).flatMap((s) => this.cfg.pipeline[s]?.pool ?? []))];
     const assignee = pools.length ? { next_assignee: { enum: pools, description: `Optional: route the next stage to a specialist. Pools: ${(this.cfg.pipeline[stage]?.next ?? []).filter((s) => this.cfg.pipeline[s]?.pool).map((s) => `${s} → ${this.cfg.pipeline[s].pool.join(', ')}`).join('; ')}` } } : {};
-    return { ...assignee, ...({
+    // Duplicates are routing facts, flagged early (owner request #113).
+    const dup = ['triage', 'analysis', 'feature-grooming'].includes(stage) ? { duplicate_of: { type: 'number', description: 'The open issue this one duplicates. The product owner confirms before it closes; both issues get a back-link.' } } : {};
+    return { ...assignee, ...dup, ...({
       triage: { priority: { enum: ['P0', 'P1', 'P2', 'P3'] }, type: { enum: ['feature', 'bug', 'incident', 'tech-debt', 'chore'] } },
       build: {
         pr_draft: { type: 'boolean', description: 'true while anything is provisional or pending (e.g. a mirrored ADR awaiting security). The PR stays a draft and cannot merge.' },
         pr_body: { type: 'string', description: 'The PR description, used verbatim (prefixed with "Part of #n"). Put lines acceptance criteria check for here.' },
         no_code_change: { type: 'boolean', description: 'true only when the tech design explicitly calls for no product-repo change (e.g. a factory, memory or doc-only change). The issue then goes through review and security without a PR and closes at merge.' },
       },
-      'tech-grooming': { risk_tier: { enum: ['low', 'medium', 'high'] }, repos: { type: 'array', items: { enum: names }, description: 'Every repo this change touches.' } },
+      'tech-grooming': { risk_tier: { enum: ['low', 'medium', 'high'] }, repos: { type: 'array', items: { enum: names }, description: 'Every product repo this change touches.' },
+        all_repos: { type: 'boolean', description: 'true only if the change touches every product repo. An empty repos list is never read as "all".' },
+        done_when: { type: 'array', description: 'Machine-checkable end state: after the change, `file` (in `repo`) contains `contains` exactly `count` times. ' +
+          'Before each build the dispatcher checks these on the default branch; if all already hold, the work is already done and no build runs (owner request #122).',
+          items: { type: 'object', properties: { repo: { enum: [...names, ...(this.factory ? [this.factory.name] : [])] }, file: { type: 'string' }, contains: { type: 'string' }, count: { type: 'number' } }, required: ['file', 'contains', 'count'] } },
+        delta_of: { type: 'number', description: 'The open issue whose change this one builds on, when both edit the same files. The claims check needs this, or wait/wait_for, or duplicate_of.' },
+        duplicate_of: { type: 'number', description: 'The open issue this one duplicates. The product owner confirms before it closes.' },
+        ...(this.factory ? { factory_paths: { type: 'array', items: { type: 'string' }, description: `Only for a change to the factory itself (${this.factory.repo}): ` +
+          'the code paths it edits, e.g. deploy/local-node.sh or factory/lib/checks.mjs. The engineer gets a factory worktree on the issue branch; ' +
+          'it is reviewed and security-checked like any change, never deployed, and merges only with the owner\'s approval. ' +
+          'org/, memory/ and library/ are this install\'s data, not factory code: change those through process_proposal.' } } : {}) },
       release: { deploy_now: { type: 'boolean' }, environment: { enum: this.envs }, hold_minutes: { type: 'number' },
         no_runtime_surface: { type: 'boolean', description: 'true only when the touched repos have nothing to run in this environment (e.g. docs, design tokens with no build, lint config). Skips deploy and the health probe; requires no_runtime_note. Otherwise deploy_now must deploy and pass the health probe, or the release is held.' },
         no_runtime_note: { type: 'string', description: 'Required with no_runtime_surface: why this change has nothing to deploy or probe (at least 20 characters). Recorded in the ledger.' } },
@@ -64,7 +165,15 @@ export class Dispatcher {
   }
 
   /** The repos an issue touches (decided at tech-grooming); all of them until then. */
-  touched(state) { return state.repos?.length ? this.repos.filter((r) => state.repos.includes(r.name)) : this.repos; }
+  /** The repos an issue works in: its product repos, plus the factory's own repo when tech-grooming declared factory_paths. */
+  touched(state) {
+    const isFactory = state.factory?.paths?.length && this.factory;
+    // No product repos named: all of them, except for a factory-only change, which touches none.
+    const product = state.repos?.length ? this.repos.filter((r) => state.repos.includes(r.name)) : isFactory ? [] : this.repos;
+    return isFactory ? [...product, this.factory] : product;
+  }
+  /** Repos that are deployed and health-checked: never the factory itself (feedback 21182531). */
+  deployable(state) { return this.touched(state).filter((r) => !r.factory); }
 
   // ── scheduling ──────────────────────────────────────────────────────────
   busy(role) { return [...this.running.values()].filter((r) => r.role === role).length; }
@@ -111,6 +220,10 @@ export class Dispatcher {
       release: rel?.number ?? null, release_usd: +M.events().filter((e) => e.type === 'run_finished' && relIssues.has(Number(e.issue))).reduce((s, e) => s + (e.cost_usd ?? 0), 0).toFixed(2),
       at: now().toISOString() };
     M.kv('spend', this.spend);
+    if (this.spend.today_usd !== this.spendLogged) { // history, so a COE can tell when a gate was crossed (owner request #105)
+      this.spendLogged = this.spend.today_usd;
+      appendFileSync(p('memory/state/spend-history.jsonl'), JSON.stringify(this.spend) + '\n');
+    }
     const open = new Set(issues.map((i) => i.number));
     for (const f of existsSync(p('memory/state')) ? readdirSync(p('memory/state')).filter((f) => /^issue-\d+\.json$/.test(f)) : []) {
       const n = Number(f.match(/\d+/)[0]), st = M.issueState(n);
@@ -146,6 +259,21 @@ export class Dispatcher {
       if (state.waitFor?.length) { // parked on planned dependencies: free until each has merged or closed
         const still = state.waitFor.filter((m) => open.has(m) && !Object.keys(M.issueState(m).merged ?? {}).length);
         if (still.length) continue;
+        // A dependency that closed without being done (not planned, superseded, duplicate) is a re-route, not a release (owner request #112).
+        const gone = [];
+        for (const m of state.waitFor.filter((x) => !open.has(x))) { const c = await this.closedReason(m); if (c.reason !== 'COMPLETED' || c.replacement) gone.push({ m, ...c }); }
+        if (gone.length) {
+          const repl = gone.map((g) => g.replacement).filter((r) => r && open.has(r));
+          for (const g of gone) M.record('dependency_superseded', { parent: g.m, reason: g.reason, replacement: g.replacement ?? null }, { issue: n });
+          state.waitFor = repl.length ? repl : null;
+          const order = STAGE_ORDER(cfg), to = order.indexOf(stage) > order.indexOf('feature-grooming') ? 'feature-grooming' : stage;
+          state.lastHandoff = { from: 'dependency', by: 'dispatcher', text: gone.map((g) => `Parent #${g.m} closed as ${g.reason.toLowerCase().replace('_', ' ')}${g.replacement ? ` (→ #${g.replacement})` : ''}.`).join(' ') +
+            (repl.length ? ` Re-parent onto ${repl.map((r) => `#${r}`).join(', ')}: rework the spec against it; it waits for it again.` : ' Rework the spec without it, or cut the issue.') };
+          M.saveIssueState(n, state);
+          await T.comment(this.repo, n, `### ↪️ ${state.lastHandoff.text}${to !== stage ? `\nBack to \`${to}\`.` : ''}`);
+          if (to !== stage) await this.move(issue, stage, to, state);
+          continue;
+        }
         M.record('dependency_ready', { stage, waited_for: state.waitFor }, { issue: n });
         state.waitFor = null; M.saveIssueState(n, state);
       }
@@ -157,6 +285,21 @@ export class Dispatcher {
           continue;
         }
         if (state.waiting === 'backlog') { state.waiting = null; M.saveIssueState(n, state); }
+      }
+      // The issue's own gate (owner request #105): checked before every stage run, not just at build. A failed gate starts no
+      // work; the product owner decides once whether to cut it or keep it (a kept issue isn't asked again for the same gate).
+      const gates = parseGates(issue.body);
+      if (JSON.stringify(gates) !== JSON.stringify(state.gates ?? null)) { state.gates = gates; M.saveIssueState(n, state); }
+      if (gates && JSON.stringify(state.gateKept?.gates) !== JSON.stringify(gates)) {
+        const g = checkGate(gates, this.spend, rel?.issues?.includes(n), now());
+        if (!g.ok) {
+          if (!state.gateFailed) { state.gateFailed = { at: now().toISOString(), reason: g.reason }; M.saveIssueState(n, state); M.record('gate_failed', { stage, reason: g.reason, gates }, { issue: n }); }
+          if (!this.draining && budgetLeft > 0) {
+            this.running.set(n, { role: 'product-owner', stage: 'cut', since: now().toISOString() });
+            this.gateCut(issue, stage, state, g.reason).catch((e) => console.error(`✗ #${n} gate: ${e.message}`)).finally(() => this.running.delete(n));
+          }
+          continue;
+        }
       }
 
       const freeze = ['merge', 'release'].includes(stage) && T.priorityOf(issue) !== 'P0' ? this.activeFreeze() : null;
@@ -263,6 +406,32 @@ export class Dispatcher {
     const cwd = st.workspace ? await R.worktrees(n, this.touched(state)) : HOME;
     const schema = verdictSchema(st.next, this.extra(stage));
     issue.comments ??= await T.viewIssue(this.repo, n).then((i) => i.comments).catch(() => []); // people's words go in the brief
+    // Already on main? (owner request #122) Read the done_when files on a fresh default-branch checkout; no build if all hold.
+    if (stage === 'build' && state.doneWhen?.length && !state.freshKept) {
+      const bases = {};
+      for (const name of new Set(state.doneWhen.map((c) => c.repo ?? this.touched(state)[0]?.name))) {
+        const r = this.repoByName(name); if (r) bases[name] = await R.ensureBase(r); // fetches and checks out origin/<default>
+      }
+      const read = (repoName, file) => {
+        const base = bases[repoName ?? this.touched(state)[0]?.name]; if (!base) return null;
+        const full = path.resolve(base, file);
+        if (!full.startsWith(`${base}/`)) return null; // never outside the checkout
+        try { return readFileSync(full, 'utf8'); } catch { return null; }
+      };
+      const f = freshness(state.doneWhen, read);
+      if (f.allHold) {
+        const shas = await Promise.all(Object.entries(bases).map(async ([k, b]) => `${k}@${(await R.git(['rev-parse', '--short', 'HEAD'], b)).trim()}`));
+        M.record('already_satisfied', { checks: f.results.length, on: shas }, { issue: n });
+        const d = await this.cutDecision(issue, stage, state, `Every done_when check in the tech design already holds on ${shas.join(', ')}: ` +
+          `${f.results.map((x) => `${x.file} contains "${x.contains.slice(0, 60)}" ×${x.found}`).join('; ')}. Nothing is left to build. Cutting closes the issue as already done.`, 'build');
+        if (d === 'waiting') return;
+        if (d === 'rejected') {
+          M.record('transition', { stage, to: 'rejected', outcome: 'reject', summary: `already satisfied on ${shas.join(', ')}`, kind: 'already_satisfied' }, { issue: n });
+          return this.move(issue, stage, 'rejected', state);
+        }
+        state.freshKept = true; M.saveIssueState(n, state); // the product owner wants the build anyway: don't ask again
+      }
+    }
     M.snapshotArtifact(n, stage); // the agent may rewrite its artifact file during the run; keep the version it starts from
     const ownFile = p('memory/specs', `issue-${n}`, `${stage}.md`);
     (this.before ??= new Map()).set(`${n}:${stage}`, existsSync(ownFile) ? readFileSync(ownFile, 'utf8') : ''); // what the guard compares against
@@ -350,18 +519,74 @@ export class Dispatcher {
       await T.comment(repo, n, `### ⏸️ ${role} · \`${stage}\` waits for ${deps.map((d) => `#${d}`).join(', ')}\n${v.summary}\n\nThis resumes at \`${stage}\` by itself once ${deps.length > 1 ? 'each has' : 'it has'} merged or closed.`);
       return;
     }
+    // `reject` means cut (owner request #104, COE on #7). It never routes forward: it closes where `rejected` is an option,
+    // and elsewhere the product owner decides the cut; keeping the issue sends it where the agent pointed.
+    const cut = rejectRoute(st.next, v, stage);
+    if (cut) {
+      M.record('reject_rerouted', { stage, asked: v.next_stage, allowed: cut.action === 'close' }, { actor: role, issue: n });
+      if (cut.action === 'close') v.next_stage = 'rejected';
+      else {
+        for (const d of v.decisions ?? []) M.decide(d, { actor: role, issue: n });
+        const keepTo = cut.keepTo;
+        const d = await this.cutDecision(issue, stage, state, `The ${role} asked to cut #${n} at \`${stage}\`: ${v.summary}`, keepTo);
+        if (d === 'waiting') return;
+        if (d === 'rejected') {
+          M.record('transition', { stage, to: 'rejected', outcome: 'reject', summary: v.summary?.slice(0, 500), kind: 'cut' }, { actor: role, issue: n });
+          return this.move(issue, stage, 'rejected', state);
+        }
+        v.outcome = st.next.indexOf(keepTo) >= 0 && STAGE_ORDER(cfg).indexOf(keepTo) < STAGE_ORDER(cfg).indexOf(stage) ? 'loop_back' : 'advance';
+        v.next_stage = keepTo;
+      }
+    }
+    // A duplicate is a routing fact (owner request #113): both issues get a back-link, and the product owner confirms before
+    // it closes. Kept, it carries on as the agent routed it.
+    const dup = Number(v.duplicate_of) || null;
+    if (dup && dup !== n && ['triage', 'analysis', 'feature-grooming', 'tech-grooming'].includes(stage) && v.outcome !== 'reject') {
+      M.record('duplicate_flagged', { of: dup, summary: v.summary?.slice(0, 300) }, { actor: role, issue: n });
+      await T.comment(repo, dup, `### 🔗 #${n} may duplicate this issue\nThe ${role} flagged it at \`${stage}\`. The product owner decides whether #${n} closes.`).catch(() => {});
+      const keepTo = v.next_stage && v.next_stage !== 'blocked' ? v.next_stage : stage;
+      const d = await this.cutDecision(issue, stage, state, `The ${role} says #${n} duplicates #${dup}: ${v.summary} Cutting closes #${n} as a duplicate of #${dup}.`, keepTo);
+      if (d === 'waiting') return;
+      if (d === 'rejected') {
+        M.record('transition', { stage, to: 'rejected', outcome: 'reject', summary: `duplicate of #${dup}`, kind: 'duplicate' }, { actor: role, issue: n });
+        await T.comment(repo, n, `Closed as a duplicate of #${dup}.`);
+        return this.move(issue, stage, 'rejected', state);
+      }
+    }
+    // tech-grooming must say where the work happens (owner request #108): an empty repos list never silently means "all".
+    if (stage === 'tech-grooming' && v.outcome === 'advance') {
+      const text = this.artifactOf(n, stage, res), bad = [];
+      if (!v.repos?.length && !v.factory_paths?.length && !v.all_repos) bad.push('Name the repos this change touches in `repos`, list `factory_paths` for a factory change, or set `all_repos: true`.');
+      // The factory's code (not memory/ paths, which every design quotes): its repo slug, or a path into deploy/, factory/, templates/, bin/, tests/.
+      if (this.factory && !v.factory_paths?.length && new RegExp(`\\b${this.factory.repo.replace('/', '\\/')}\\b|software-factory\\/(deploy|factory|templates|bin|tests)\\/`, 'i').test(text))
+        bad.push(`The design names the factory repo, but \`factory_paths\` is empty. List the factory files it edits there.`);
+      for (const r of this.repos) if (new RegExp(`^\\s*\\**\\s*repos?\\s*:?\\**\\s*:?.*\\b${r.name}\\b`, 'im').test(text) && v.repos?.length && !v.repos.includes(r.name))
+        bad.push(`The design's Repo line names ${r.name}, but \`repos\` doesn't include it.`);
+      // Two open issues editing the same files must say how they relate (owner request #115; #42 and #64 both wrote local-node.sh).
+      const mine = factoryPaths(v.factory_paths).ok, clash = mine.length ? clashes(n, mine, claimsIndex()) : [];
+      if (clash.length && !v.delta_of && !v.duplicate_of)
+        bad.push(`Other open issues already claim these files: ${clash.map((c) => `#${c.issue} (${c.path})`).join(', ')}. Say how this issue relates: \`delta_of\` (it builds on that issue's change), ` +
+          `outcome \`wait\` with \`wait_for\`, or \`duplicate_of\`.`);
+      if (bad.length) {
+        state.lastHandoff = { from: `checks:${stage}`, by: 'dispatcher', text: `The tech-grooming verdict's repo fields don't match the design. Fix and advance again:\n${bad.map((b) => `- ${b}`).join('\n')}` };
+        M.saveIssueState(n, state);
+        M.record('check_failed', { stage, checks: ['repo_fields'], failures: bad }, { actor: role, issue: n });
+        await T.comment(repo, n, `### ✗ \`${stage}\` repo fields don't match the design, back to the ${role}\n${bad.map((b) => `- ${b}`).join('\n')}`);
+        return;
+      }
+    }
     let next = v.outcome === 'blocked' || v.outcome === 'wait' ? 'blocked' : v.next_stage; // `wait` without issues to wait for is a block
     // Council stages route rather than loop, and `forward` targets (verify → release = promote) are progress.
     const isLoop = !st.council && !(st.forward ?? []).includes(next) && order.includes(next) && order.indexOf(next) < order.indexOf(stage);
 
     // Repeated loop-backs: the agents involved discuss the route instead of one agent deciding alone.
-    if (isLoop && !fromCouncil && state.loops + 1 >= (cfg.loops.council_after ?? 2)) {
+    if (isLoop && !fromCouncil && this.loopsSince(state) + 1 >= (cfg.loops.council_after ?? 2)) {
       const target = cfg.pipeline[next];
       const members = [...new Set([role, target.role ?? target.council?.chair, 'product-manager'].filter(Boolean))];
       const c = await council({
         cfg, name: `issue-${n}/loop-${stage}-to-${next}-${Date.now()}`, topic: `#${n} keeps looping (${stage} → ${next}). What is the right route?`,
         context: `${this.context(issue, stage, state, cwd, { kb: 12, reviewing: true })}\n\n## The ${role}'s verdict that triggered this council\n${v.summary}\n\n${v.handoff}\n\nThis issue has looped ${state.loops} time(s): ${JSON.stringify(state.history.slice(-6))}`,
-        chair: state.loops + 1 > cfg.loops.max_loops ? 'chief-of-staff' : 'architect', members, rounds: cfg.economy?.council_rounds ?? 2, nextOptions: st.next, issue: n, cwd, extraSchema: this.extra(stage),
+        chair: this.loopsSince(state) + 1 > cfg.loops.max_loops ? 'chief-of-staff' : 'architect', members, rounds: cfg.economy?.council_rounds ?? 2, nextOptions: st.next, issue: n, cwd, extraSchema: this.extra(stage),
       });
       if (c.ok) {
         await T.comment(repo, n, `🗣️ **Council convened** on repeated loop-backs. The transcript is at \`${c.thread}\`.`);
@@ -430,6 +655,13 @@ export class Dispatcher {
     if (v.risk_tier) state.risk = v.risk_tier;
     if (v.next_assignee && (cfg.pipeline[next]?.pool ?? []).includes(v.next_assignee)) state.assign = { ...state.assign, [next]: v.next_assignee };
     if (v.repos?.length) state.repos = v.repos;
+    if (stage === 'tech-grooming' && Array.isArray(v.done_when)) { state.doneWhen = v.done_when.filter((c) => c.file && c.contains && Number.isInteger(c.count)); state.freshKept = false; }
+    if (stage === 'tech-grooming' && v.factory_paths) { // a change to the factory itself: worktree, PR and an owner-gated merge
+      const { ok, refused } = factoryPaths(v.factory_paths);
+      state.factory = ok.length && this.factory ? { paths: ok } : null;
+      if (refused.length) await T.comment(repo, n, `### ⚠️ Not factory code: ${refused.map((x) => `\`${x}\``).join(', ')}\nThese are this install's data (org/, memory/, library/) or not a code path. Change them through a process_proposal, not a factory PR.`);
+      M.record('factory_change', { paths: ok, refused }, { actor: role, issue: n });
+    }
     if (v.priority) {
       const old = T.labelsOf(issue).filter((l) => /^P[0-3]$/.test(l) && l !== v.priority);
       await T.editLabels(repo, n, { add: [v.priority], remove: old });
@@ -451,6 +683,13 @@ export class Dispatcher {
     if (stage === 'build' && next === 'review' && !(await this.publish(issue, state, v))) {
       // No product-repo commits. Allowed when the tech design says so (feedback a612e8eb); otherwise the build is incomplete.
       if (v.no_code_change && !Object.keys(state.prs ?? {}).length) { state.noCode = true; M.saveIssueState(n, state); M.record('no_code_change', { summary: v.summary?.slice(0, 300) }, { actor: role, issue: n }); }
+      else if (/does not declare/.test(v.question_for_human ?? '')) { // work in an undeclared repo: the design must name it, no council needed
+        state.lastHandoff = { from: 'build', by: 'dispatcher', text: `${v.question_for_human} The engineer's commits are kept on the issue branch.` };
+        M.saveIssueState(n, state);
+        M.record('transition', { stage, to: 'tech-grooming', outcome: 'loop_back', loop: true, loops: state.loops, kind: 'undeclared_repo', summary: v.question_for_human.slice(0, 300) }, { actor: 'dispatcher', issue: n });
+        await T.comment(repo, n, `### ↩️ Not published: ${v.question_for_human}\nBack to \`tech-grooming\` to declare it.`);
+        return this.move(issue, stage, 'tech-grooming', state);
+      }
       else next = 'blocked';
     }
     if (['review', 'security'].includes(stage)) {
@@ -470,7 +709,7 @@ export class Dispatcher {
         M.saveIssueState(n, state);
         M.record('transition', { stage, to: 'build', outcome: 'loop_back', loop: stage !== 'build', loops: state.loops, kind: 'ci_failure', summary: `CI failed: ${ci.failures.map((f) => `${f.repo}/${f.name}`).join(', ')}` }, { actor: 'ci', issue: n });
         await T.comment(repo, n, `### 🔁 CI is red, so \`${stage}\` can't advance: back to \`build\`\n${ci.table}\n\n<details><summary>Failing log excerpts</summary>\n\n${ci.failures.map((f) => `**${f.repo}: ${f.name}**\n\`\`\`\n${(f.log || '').slice(-3000)}\n\`\`\``).join('\n\n')}\n</details>`);
-        if (state.loops > cfg.loops.max_loops) return this.escalate(n, state, 'build', 'CI keeps failing.');
+        if (this.loopsSince(state) > cfg.loops.max_loops) return this.escalate(n, state, 'build', 'CI keeps failing.');
         return this.move(issue, stage, 'build', state);
       }
       if (ci.status === 'timeout') M.record('ci_wait_timeout', { stage, table: ci.table.slice(0, 1000) }, { issue: n }); // merge still enforces green
@@ -479,12 +718,12 @@ export class Dispatcher {
       // Deployed means the deploy step exited 0 AND the health URL answered 200 (feedback 2fa9b900: a repo with no deploy
       // config used to fall out of the loop, so staging was marked deployed and the issue moved to verify with nothing running).
       const env = v.environment ?? this.nextEnv(state);
-      const d = await decideDeploy({ verdict: v, repos: this.touched(state), env, runDeploy: (r, e) => this.deploy(r, e), probe: (u) => probeHealth(u) });
+      const d = await decideDeploy({ verdict: v, repos: this.deployable(state), env, runDeploy: (r, e) => this.deploy(r, e), probe: (u) => probeHealth(u) });
       for (const [type, data] of d.events) M.record(type, { ...data, risk: state.risk }, { actor: type === 'deploy' ? role : 'deploy', issue: n });
       if (d.status === 'deployed') {
         state.deployed = { ...state.deployed, [env]: now().toISOString() };
         state.lastEnv = env;
-        await T.comment(repo, n, `### 🚀 Deployed to \`${env}\` (deploy exited 0, health 200)\n${this.touched(state).map((r) => `- ${r.name}: ${r.health[env]}`).join('\n')}`);
+        await T.comment(repo, n, `### 🚀 Deployed to \`${env}\` (deploy exited 0, health 200)\n${this.deployable(state).map((r) => `- ${r.name}: ${r.health[env]}`).join('\n')}`);
       } else if (d.status === 'no_runtime') { // nothing to run: the env is passed, not deployed, so verify and promotion still work
         state.noRuntime = { ...state.noRuntime, [env]: now().toISOString() };
         state.lastEnv = env;
@@ -508,9 +747,9 @@ export class Dispatcher {
     }
     if (stage === 'verify') {
       for (const inc of v.incidents ?? []) await this.fileIncident(inc, n);
-      if (v.rollback) for (const r of this.touched(state)) await this.rollback(r, state.lastEnv, n);
+      if (v.rollback) for (const r of this.deployable(state)) await this.rollback(r, state.lastEnv, n);
       if (v.rollback || next === 'build') this.coe({ issue: n, kind: v.rollback ? 'rollback' : 'regression', from: 'verify', to: 'build', by: role, reason: `${v.summary}\n\n${v.handoff}` });
-      else if (['done', 'release'].includes(next)) for (const r of this.touched(state)) this.markVerified(r, state.lastEnv, n);
+      else if (['done', 'release'].includes(next)) for (const r of this.deployable(state)) this.markVerified(r, state.lastEnv, n);
     }
     M.saveIssueState(n, state);
 
@@ -546,7 +785,7 @@ export class Dispatcher {
       }
       return this.escalate(n, state, null, `The council could not decide.\n\n${v.question_for_human || v.summary}`, owners(cfg));
     }
-    if (isLoop && state.loops > (cfg.loops.owner_after ?? 6)) return this.escalate(n, state, next, `Runaway: ${state.loops} loop-backs. Add \`${T.L.approved}\` to continue to \`${next}\`, or close the issue.`, owners(cfg));
+    if (isLoop && this.loopsSince(state) > (cfg.loops.owner_after ?? 6)) return this.escalate(n, state, next, `Runaway: ${state.loops} loop-backs. Add \`${T.L.approved}\` to continue to \`${next}\`, or close the issue.`, owners(cfg));
     if (st.checks?.length && v.outcome === 'advance') { // machine checks first: the artifact must pass before anyone approves it
       const { runChecks } = await import('./checks.mjs');
       const c = runChecks(st.checks, v.artifact_markdown, cfg, { issue: n });
@@ -580,7 +819,21 @@ export class Dispatcher {
     if (from !== to) await T.setStage(this.repo, n, from, to);
   }
 
+  /** Loop-backs since the owner last approved: what council, chair and runaway thresholds count (the full history is kept). */
+  loopsSince(state) { return (state.loops ?? 0) - (state.loopBase ?? 0); }
+
   async escalate(n, state, pending, message, to = owners(this.cfg)) {
+    // Never ask the owner twice about the same unchanged build (owner request #109): the second time with an identical
+    // HEAD, it goes back to tech-grooming with the diagnosis instead.
+    const stage = this.running.get(n)?.stage, heads = JSON.stringify(state.heads ?? {});
+    if (stage === 'build' && state.escalations && state.lastEscalation?.stage === stage && state.lastEscalation.heads === heads) {
+      state.lastHandoff = { from: 'escalation', by: 'dispatcher', text: `Identical HEAD resubmitted after the owner's approval, so the same failure would recur: ${message.replace(/\s+/g, ' ').slice(0, 600)} Fix the cause in the design (declared repos, factory_paths, scope) before build runs again.` };
+      state.lastEscalation = null; M.saveIssueState(n, state);
+      M.record('escalation_rerouted', { stage, to: 'tech-grooming', reason: message.slice(0, 300) }, { issue: n });
+      await T.comment(this.repo, n, `### ↩️ Not asking the owner again: the build is unchanged since the last approval\n${state.lastHandoff.text}\nBack to \`tech-grooming\`.`);
+      return this.move({ number: n }, stage, 'tech-grooming', state);
+    }
+    state.lastEscalation = { stage: stage ?? null, heads, at: now().toISOString() };
     state.pending = pending;
     state.escalatedAt = now().toISOString();
     M.saveIssueState(n, state);
@@ -605,10 +858,11 @@ export class Dispatcher {
       state.lastHandoff = { from: stage, by: said[0].by ?? 'human', text };
     }
     await T.editLabels(this.repo, n, { remove: [T.L.human, T.L.approved] });
-    if (state.pending === 'merge' && stage === 'merge') state.mergeApproved = true;
+    if (state.pending === 'merge' && stage === 'merge') { state.mergeApproved = true; if (state.factoryGate) state.factoryApproved = true; } // a person approved the merge
     else if (state.pending && state.pending !== stage) await this.move(issue, stage, state.pending, state);
-    M.record('human_approved', { stage, to: state.pending }, { actor: 'human', issue: n });
-    state.pending = null; state.loops = 0; state.failures = 0; state.personStage = null;
+    M.record('human_approved', { stage, to: state.pending, escalations: (state.escalations ?? 0) + 1, loops: state.loops }, { actor: 'human', issue: n });
+    // The loop history is kept (owner request #109): thresholds count loops since this approval, and approvals are counted.
+    state.pending = null; state.loopBase = state.loops; state.escalations = (state.escalations ?? 0) + 1; state.failures = 0; state.personStage = null;
     M.saveIssueState(n, state);
   }
 
@@ -631,6 +885,15 @@ export class Dispatcher {
       if (!a.approved) return this.move(issue, 'merge', a.route_to, state);
       state.mergeApproved = true; M.saveIssueState(n, state);
     }
+    // A change to the factory itself merges only with a person's approval (feedback 21182531): it alters the org's own rules.
+    const fpr = this.factory && state.prs?.[this.factory.name];
+    if (fpr && !state.merged?.[this.factory.name] && !state.factoryApproved) {
+      state.factoryGate = true; M.saveIssueState(n, state);
+      return this.escalate(n, state, 'merge', `**Factory change: your approval is needed to merge.** This issue changes the factory's own code: ` +
+        `https://github.com/${this.factory.repo}/pull/${fpr}. It passed review and security. Read the diff, then click "Post & approve" ` +
+        `(or add \`${T.L.approved}\`) to merge it, or reply with the changes needed. After it merges, the running factory changes only when ` +
+        `you pull the code and restart the dispatcher.`, owners(cfg));
+    }
     // A draft is not ready: provisional work goes back to build instead of merging.
     const drafts = [];
     for (const [name, pr] of prs) if (await T.isDraft(this.repoByName(name).repo, pr).catch(() => false)) drafts.push(name);
@@ -651,7 +914,7 @@ export class Dispatcher {
       M.record('transition', { stage: 'merge', to: 'build', outcome: 'loop_back', loop: true, loops: state.loops, summary: `merge conflict: ${conflicts}` }, { issue: n });
       await T.comment(repo, n, `### 🔁 Merge conflict (${conflicts.join(', ')}), requeued to \`build\` to rebase`);
       this.coe({ issue: n, kind: 'merge_conflict', from: 'merge', to: 'build', by: 'git', reason: state.lastHandoff.text });
-      if (state.loops > cfg.loops.max_loops) return this.escalate(n, state, 'build', 'Merge conflicts keep recurring.');
+      if (this.loopsSince(state) > cfg.loops.max_loops) return this.escalate(n, state, 'build', 'Merge conflicts keep recurring.');
       return this.move(issue, 'merge', 'build', state);
     }
     const checks = {};
@@ -665,21 +928,23 @@ export class Dispatcher {
       M.record('transition', { stage: 'merge', to: 'build', outcome: 'loop_back', loop: true, loops: state.loops, summary: `CI failed: ${failed}` }, { issue: n });
       await T.comment(repo, n, `### 🔁 CI failed (${failed.join(', ')}), requeued to \`build\``);
       this.coe({ issue: n, kind: 'ci_failure', from: 'merge', to: 'build', by: 'ci', reason: state.lastHandoff.text });
-      if (state.loops > cfg.loops.max_loops) return this.escalate(n, state, 'build', 'CI keeps failing.');
+      if (this.loopsSince(state) > cfg.loops.max_loops) return this.escalate(n, state, 'build', 'CI keeps failing.');
       return this.move(issue, 'merge', 'build', state);
     }
-    for (const r of this.repos) { // config order = dependency order
+    for (const r of [...this.repos, ...(this.factory ? [this.factory] : [])]) { // config order = dependency order; the factory last
       const pr = state.prs[r.name];
       if (!pr || state.merged?.[r.name]) continue;
       await T.mergePr(r.repo, pr);
       state.merged = { ...state.merged, [r.name]: now().toISOString() };
       M.saveIssueState(n, state);
       const mergeSha = (await T.gh(['pr', 'view', String(pr), '-R', r.repo, '--json', 'mergeCommit', '--jq', '.mergeCommit.oid']).catch(() => '')) || null;
-      M.record('merged', { repo: r.name, pr, risk: state.risk, checks: checks[r.name], head_sha: state.heads?.[r.name] ?? null, merge_sha: mergeSha }, { issue: n });
+      M.record(r.factory ? 'factory_merged' : 'merged', { repo: r.name, pr, risk: state.risk, checks: checks[r.name], head_sha: state.heads?.[r.name] ?? null, merge_sha: mergeSha }, { issue: n });
     }
-    await T.comment(repo, n, `### ✅ Merged ${this.prList(state)} (risk: ${state.risk ?? 'n/a'})`);
-    await R.dropWorktrees(n, this.repos);
-    await this.move(issue, 'merge', 'release', state);
+    const factoryNote = state.merged?.[this.factory?.name] ? `\n\nThe factory change is merged into ${this.factory.repo}. The running factory picks it up only when the owner pulls the code and restarts the dispatcher.` : '';
+    await T.comment(repo, n, `### ✅ Merged ${this.prList(state)} (risk: ${state.risk ?? 'n/a'})${factoryNote}`);
+    await R.dropWorktrees(n, this.touched(state));
+    // Only product repos are released; a factory-only change is finished once merged.
+    await this.move(issue, 'merge', this.deployable(state).length ? 'release' : 'done', state);
   }
 
   profile(env) { const ro = this.cfg.aws?.readonly_profile ?? ''; return typeof ro === 'string' ? ro : ro[env] ?? ''; }
@@ -833,7 +1098,57 @@ export class Dispatcher {
     } catch (e) { return { ok: false, log: `${e.stdout ?? ''}${e.stderr ?? ''}${e.message}` }; }
   }
 
-  repoByName(name) { return this.repos.find((r) => r.name === name); }
+  /**
+   * The product owner decides a requested cut (owner requests #104, #105): close the issue as not planned, or keep it going
+   * to `keepTo`. Returns 'rejected' | keepTo | 'waiting'. A person holding the role gets it as an approval instead.
+   */
+  async cutDecision(issue, stage, state, why, keepTo) {
+    const n = issue.number, person = holderOf(this.cfg, 'product-owner');
+    if (person) {
+      await this.escalate(n, state, 'rejected', `**Cut requested at \`${stage}\`.** ${why}\n\nApprove to close #${n} as not planned. To keep it, reply saying so and remove the label; it continues to \`${keepTo}\`.`, [person]);
+      return 'waiting';
+    }
+    const res = await runAgent({ cfg: this.cfg, role: 'product-owner', issue: n, label: `cut-${stage}`, cwd: HOME,
+      schema: { type: 'object', properties: { cut: { type: 'boolean' }, summary: { type: 'string', description: 'The decision and why, for the issue thread.' },
+        decisions: { type: 'array', items: DECISION } }, required: ['cut', 'summary'] },
+      prompt: `${this.context(issue, stage, state, HOME, { kb: 12, reviewing: true })}\n\n# Cut decision\n${why}\n\nYou own scope. Decide now: ` +
+        `**cut** (#${n} closes as not planned, and you tell the client through the account executive if it was in their plan) or **keep** ` +
+        `(it continues to \`${keepTo}\`). Weigh the release goal, the client's approved plan and spend. Record the decision.` });
+    if (!res.ok) {
+      if (!INFRA.test(String(res.error))) await this.escalate(n, state, null, `The product owner couldn't decide a requested cut: ${String(res.error).slice(0, 300)}`);
+      return 'waiting';
+    }
+    for (const d of res.out.decisions ?? []) if (d.title && d.decision) M.decide({ rationale: '', ...d }, { actor: 'product-owner', issue: n });
+    M.record('cut_decided', { stage, cut: res.out.cut, summary: res.out.summary.slice(0, 500), cost_usd: res.cost }, { actor: 'product-owner', issue: n });
+    await T.comment(this.repo, n, `### ${res.out.cut ? '✂️ Cut' : '▶️ Kept'} · product-owner at \`${stage}\`\n${res.out.summary}`);
+    return res.out.cut ? 'rejected' : keepTo;
+  }
+
+  /** How a closed issue ended: { reason: COMPLETED | NOT_PLANNED | …, replacement } (from "superseded by #M" / "duplicate of #M"). Cached. */
+  async closedReason(m) {
+    if (this.closedCache?.has(m)) return this.closedCache.get(m);
+    const i = await T.gh(['issue', 'view', String(m), '-R', this.repo, '--json', 'stateReason,comments']).then(JSON.parse).catch(() => null);
+    if (!i) return { reason: 'COMPLETED' }; // can't tell: treat as done, as before
+    const said = (i.comments ?? []).slice(-3).map((c) => c.body).join('\n');
+    const r = { reason: i.stateReason || 'COMPLETED', replacement: Number(said.match(/(?:superseded by|duplicate of)\s+#(\d+)/i)?.[1]) || null };
+    (this.closedCache ??= new Map()).set(m, r);
+    return r;
+  }
+
+  /** A failed gate: the product owner cuts the issue or keeps it; kept issues aren't asked again for the same gate. */
+  async gateCut(issue, stage, state, reason) {
+    const n = issue.number;
+    const d = await this.cutDecision(issue, stage, state, `This issue's gate has failed: ${reason}. No work starts while it fails.`, stage);
+    if (d === 'waiting') return;
+    if (d === 'rejected') {
+      M.record('transition', { stage, to: 'rejected', outcome: 'reject', summary: `gate failed: ${reason}`, kind: 'gate_cut' }, { actor: 'product-owner', issue: n });
+      return this.move(issue, stage, 'rejected', state);
+    }
+    state.gateKept = { at: now().toISOString(), gates: state.gates, reason }; state.gateFailed = null;
+    M.saveIssueState(n, state);
+  }
+
+  repoByName(name) { return this.repos.find((r) => r.name === name) ?? (this.factory?.name === name ? this.factory : undefined); }
   prList(state) { return Object.entries(state.prs ?? {}).map(([name, pr]) => `${this.repoByName(name).repo}#${pr}`).join(', '); }
   // An environment passed with no_runtime_surface counts as done for promotion, without ever being marked deployed.
   nextEnv(state) { return this.envs.find((e) => !state.deployed?.[e] && !state.noRuntime?.[e]) ?? this.envs.at(-1); }
@@ -861,7 +1176,24 @@ export class Dispatcher {
       state.heads = { ...state.heads, [r.name]: head };
       M.record('pr', { repo: r.name, pr: state.prs[r.name], commits: ahead, head_sha: head }, { issue: n });
     }
-    if (!Object.keys(state.prs).length) { v.question_for_human = 'The engineer reported done, but no repo has commits on the branch.'; return false; }
+    // Commits in a worktree this issue doesn't own are never published (feedback 01406a6d): say exactly which, and how to declare it.
+    const owned = new Set(this.touched(state).map((r) => r.name)), stray = [];
+    for (const d of existsSync(R.issueDir(n)) ? readdirSync(R.issueDir(n)) : []) {
+      if (owned.has(d) || !statSync(`${R.issueDir(n)}/${d}`).isDirectory()) continue;
+      // Commits not on the repo's default branch, pushed or not (owner request #107): a pushed but undeclared branch is still stray.
+      const dir = `${R.issueDir(n)}/${d}`;
+      const base = (await R.git(['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD'], dir).catch(() => '')) ||
+        ((await R.git(['rev-parse', '--verify', '--quiet', 'origin/main'], dir).catch(() => '')) ? 'origin/main' : 'origin/master');
+      const unpushed = Number(await R.git(['rev-list', '--count', `${base}..HEAD`], dir).catch(() => R.git(['rev-list', '--count', 'HEAD', '--not', '--remotes'], dir).catch(() => '0')));
+      if (unpushed) stray.push(`${d} (${unpushed} commit${unpushed > 1 ? 's' : ''})`);
+    }
+    if (stray.length) {
+      v.question_for_human = `Commits in ${stray.join(', ')}, which this issue's tech design does not declare, so they were not published. ` +
+        (stray.some((s) => s.startsWith(this.factory?.name ?? '\0')) ? 'For a change to the factory itself, tech-grooming must list factory_paths (merge then needs the owner\'s approval).' : 'Loop back to tech-grooming to add the repo, or move the work into a declared repo.');
+      M.record('publish_refused', { stray }, { issue: n });
+      return false;
+    }
+    if (!Object.keys(state.prs).length) { v.question_for_human = `The engineer reported done, but no declared repo (${[...owned].join(', ') || 'none'}) has commits on the branch.`; return false; }
     return true;
   }
 
@@ -958,7 +1290,10 @@ export class Dispatcher {
           ? `\n## Before you hand in\nYour artifact must have a full \`## AC → evidence\` table (| AC | Test | Status |) with a row for every AC in the spec, restated in full on every revision. ` +
             `Status is pass, or post-deploy (SRE) for checks that can only run after deploy. A partial, missing or failing AC means you don't advance: finish it, or loop back to tech-grooming. ` +
             `Write the artifact to ${p('memory/specs', `issue-${n}`, `${stage}.md`)} and run \`sf lint build ${n}\` before handing in (owner request #69).`
-          : '';
+          : (st.checks ?? []).includes('design_lint')
+            ? `\n## Before you hand in\nYour design needs a "Repo invariants honoured" section, and on a revision a "Delta impact" section (what changed and what it affects). ` +
+              `Write numeric limits in §5 with their arithmetic (=, ≤). Write the design to ${p('memory/specs', `issue-${n}`, `${stage}.md`)} and run \`sf lint design ${n}\` before handing in (owner request #100).`
+            : '';
     return [
       `# Issue #${n}: ${issue.title}`, `Tracker: ${repo} · ${issue.url ?? ''}`, `Now: ${now().toString()}`, '',
       `## Your stage: \`${stage}\``, st.goal, '',
@@ -974,6 +1309,12 @@ export class Dispatcher {
         `You can't advance while any check is red: the dispatcher sends red CI back to build automatically.` +
         (issue.ci.failures.length ? `\n${issue.ci.failures.map((f) => `\n**${f.repo}: ${f.name}** (failing log tail)\n\`\`\`\n${(f.log || '').slice(-2000)}\n\`\`\``).join('')}` : '') : '',
       history.length ? `\n## History of this issue\n${history.join('\n')}` : '',
+      (() => { // other open issues editing the same factory files (owner request #115)
+        if (!state.factory?.paths?.length || !['tech-grooming', 'build', 'review'].includes(stage)) return '';
+        let index = {}; try { index = JSON.parse(read('memory/state/claims.json') || '{}'); } catch {}
+        const c = clashes(n, state.factory.paths, index);
+        return c.length ? `\n## ⚠️ Other open issues edit the same files\n${c.map((x) => `- #${x.issue}: ${x.path} (yours: ${x.mine})`).join('\n')}\nCoordinate: build on theirs (delta_of), wait for it, or mark a duplicate. Don't overwrite their work.` : '';
+      })(),
       digest ? `\n## How your team works (digest of the operating model and the ${team} charter)\n${digest}` : '',
       brief ? `\n## The product (brief)\n${brief}` : '',
       answers ? `\n## Owner answers (current)\n${clip(answers, 8, 'memory/product/answers.current.md')}` : '',
@@ -985,18 +1326,18 @@ export class Dispatcher {
       `- \`sf recall "<keywords>"\` for decisions and learnings from other issues.`,
       st.workspace ? `\n## Workspace (cwd: ${cwd})\nOne sub-folder per repo, each a git worktree on branch \`sf/issue-${n}\`:\n${this.touched(state).map((r) => `- \`${r.name}/\`: ${r.repo} (base \`origin/${r.default_branch}\`)`).join('\n')}\nOnly change repos the tech design names. If another repo must change, loop back to tech-grooming.` : '',
       stage === 'release' ? `\n## Go-live policy\n${cfg.release.policy}\nEnvironments in order: ${this.envs.join(' → ')}. Already deployed: ${JSON.stringify(state.deployed ?? {})}. The next one is **${this.nextEnv(state)}**.${Object.keys(state.noRuntime ?? {}).length ? ` Passed with no runtime surface: ${JSON.stringify(state.noRuntime)}.` : ''}\n` +
-        `Deploy config for ${this.nextEnv(state)}:\n${this.touched(state).map((r) => `- ${r.name}: deploy ${r.deploy_command ? `\`${r.deploy_command}\`` : r.deploy_workflow || '(none configured)'}, health ${r.health?.[this.nextEnv(state)] || '(none configured)'}`).join('\n')}\n` +
+        `Deploy config for ${this.nextEnv(state)}:\n${this.deployable(state).map((r) => `- ${r.name}: deploy ${r.deploy_command ? `\`${r.deploy_command}\`` : r.deploy_workflow || '(none configured)'}, health ${r.health?.[this.nextEnv(state)] || '(none configured)'}`).join('\n')}\n` +
         `The dispatcher marks the environment deployed only if every repo's deploy exits 0 and its health URL answers 200; otherwise the release is held whatever you choose. ` +
-        `If the change has nothing to run (no build, no server, no bundle change), set \`no_runtime_surface: true\` with a \`no_runtime_note\` saying why, and no deploy or probe runs.\nRecent deploys:\n${this.touched(state).filter((r) => r.deploy_workflow).map((r) => `- \`gh run list -R ${r.repo} --workflow ${r.deploy_workflow} --limit 10\``).join('\n')}` : '',
+        `If the change has nothing to run (no build, no server, no bundle change), set \`no_runtime_surface: true\` with a \`no_runtime_note\` saying why, and no deploy or probe runs.\nRecent deploys:\n${this.deployable(state).filter((r) => r.deploy_workflow).map((r) => `- \`gh run list -R ${r.repo} --workflow ${r.deploy_workflow} --limit 10\``).join('\n')}` : '',
       stage === 'verify' ? `\n## Validate ${state.lastEnv ?? 'the deploy'} (${state.deployed?.[state.lastEnv] ? `deployed ${state.deployed[state.lastEnv]}` : state.noRuntime?.[state.lastEnv] ? `not deployed: the release manager declared no runtime surface at ${state.noRuntime[state.lastEnv]}; confirm nothing needed to run` : 'deployed ?'})\n${this.profile(state.lastEnv) ? `You have read-only AWS access (profile \`${this.profile(state.lastEnv)}\`, region ${cfg.aws?.region}). Start with \`aws sts get-caller-identity --profile ${this.profile(state.lastEnv)}\`.` : 'This environment runs on the local machine. Use the health URLs and the deploy log.'}\n` +
-        `Health URLs:\n${this.touched(state).map((r) => `- ${r.name}: ${r.health?.[state.lastEnv] || '(none configured)'}`).join('\n')}\nSignals:\n${this.signals(state.lastEnv, this.touched(state)).map((s) => `- \`${s}\``).join('\n')}\n` +
+        `Health URLs:\n${this.deployable(state).map((r) => `- ${r.name}: ${r.health?.[state.lastEnv] || '(none configured)'}`).join('\n')}\nSignals:\n${this.signals(state.lastEnv, this.deployable(state)).map((s) => `- \`${s}\``).join('\n')}\n` +
         `Environments: ${this.envs.join(' → ')}. If ${state.lastEnv} is healthy and it isn't the last environment, choose \`release\` to promote. If it is the last, choose \`done\`. A regression goes to \`build\`, and if users are impacted, say "rollback" in decisions.` : '',
       `\n## How to work`,
       `This brief already holds the digest, the product brief, the answers, the issue's comments and history, and the earlier artifacts. ` +
         `Don't re-read them or re-run \`gh issue view\` and \`sf memory issue\`. Spend your steps on the work itself; read the full documents only for a specific gap.`,
       lint,
       `\n## Choose next_stage from`, opts,
-      `\nUse \`advance\` to move forward, \`loop_back\` to send work upstream (say exactly what must change in \`handoff\`), \`reject\` to close, \`wait\` with \`wait_for\` when the plan says this issue must wait for other issues (no council; it resumes by itself), and \`blocked\` only when a decision is needed.`,
+      `\nUse \`advance\` to move forward, \`loop_back\` to send work upstream (say exactly what must change in \`handoff\`), \`reject\` to cut the issue (it closes where \`rejected\` is one of your options; elsewhere the product owner decides the cut), \`wait\` with \`wait_for\` when the plan says this issue must wait for other issues (no council; it resumes by itself), and \`blocked\` only when a decision is needed.`,
       `Put the full stage artifact in \`artifact_markdown\`.`,
     ].join('\n');
   }

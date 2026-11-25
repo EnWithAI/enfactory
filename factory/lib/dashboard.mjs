@@ -152,7 +152,7 @@ function state() {
   }
   for (const i of Object.values(issues)) {
     const f = p('memory/state', `issue-${i.n}.json`);
-    if (existsSync(f)) { const s = JSON.parse(readFileSync(f, 'utf8')); Object.assign(i, { risk: s.risk, prs: s.prs, deployed: s.deployed }); }
+    if (existsSync(f)) { const s = JSON.parse(readFileSync(f, 'utf8')); Object.assign(i, { risk: s.risk, prs: s.prs, deployed: s.deployed, gates: s.gates ?? null, gateFailed: s.gateFailed ?? null, gateKept: s.gateKept ?? null }); }
     i.working = running.find((r) => String(r.issue) === String(i.n))?.role ?? null;
   }
 
