@@ -13,6 +13,8 @@ import {
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { request } from 'node:http';
+import { lstatSync, symlinkSync } from 'node:fs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SCRIPT = join(here, '..', 'deploy', 'local-node.sh');
@@ -359,4 +361,147 @@ test('AC-64-14 README documents deploy/local-node.sh and its usage line', () => 
   const readme = readFileSync(join(here, '..', 'README.md'), 'utf8');
   assert.ok(readme.includes('deploy/local-node.sh'));
   assert.ok(readme.includes('local-node.sh <name> <env> <port> [--rollback]'));
+});
+
+// ── #53: releases carry src/shared and src/brand; the import-closure guard runs before any stop or switch. ──
+// Separate roots (shared, carry, prune, nosrc) so the AC-64 sequence above is never disturbed.
+const OVERLAY = join(here, 'fixtures', 'local-node-app-shared');
+// A git checkout of the base fixture with the shared overlay copied over it. edit(dir) changes files before the commit.
+const sharedCheckout = (label, edit = () => {}) => {
+  const dir = join(T, `repo53-${label}`);
+  cpSync(FIXTURE, dir, { recursive: true });
+  cpSync(OVERLAY, dir, { recursive: true, force: true });
+  writeFileSync(join(dir, 'label.txt'), `${label}\n`);
+  edit(dir);
+  sh('git', ['init', '-q'], dir);
+  sh('git', ['add', '-A'], dir);
+  sh('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', label], dir);
+  return { dir, sha: sh('git', ['rev-parse', '--short', 'HEAD'], dir) };
+};
+const put = (dir, rel, text) => { mkdirSync(dirname(join(dir, rel)), { recursive: true }); writeFileSync(join(dir, rel), text); };
+const postPay = (p) => new Promise((res, rej) => {
+  const body = '{}';
+  const req = request({
+    host: '127.0.0.1', port: p, path: '/api/wallet/payments', method: 'POST', agent: false,
+    headers: { 'Content-Type': 'application/json', 'X-Enwallet-Csrf': '1', Origin: `http://127.0.0.1:${p}`, 'Content-Length': Buffer.byteLength(body) },
+  }, (r) => { let s = ''; r.on('data', (d) => { s += d; }).on('end', () => res({ status: r.statusCode, body: s })); });
+  req.on('error', rej);
+  req.end(body);
+});
+const bytes = (p) => (existsSync(p) || isLink(p) ? (isLink(p) ? `link:${readlinkSync(p)}` : readFileSync(p, 'hex')) : null);
+const isLink = (p) => { try { return lstatSync(p).isSymbolicLink(); } catch { return false; } };
+const findSrcDirs = (root) => spawnSync('find', [root, '-type', 'd', '(', '-path', '*src/shared', '-o', '-path', '*src/brand', ')', '-not', '-path', `${root}/releases/*`], { encoding: 'utf8' }).stdout.trim();
+
+const SR = rootOf('shared', 'staging');
+roots.push(SR);
+let sport, S1;
+
+test('AC-53-01 release has whole src/shared and src/brand and no other src entry', async () => {
+  sport = await freePort();
+  S1 = sharedCheckout('S1', (d) => put(d, 'src/shared/extra/new.mjs', "export const NEW = 1;\n"));
+  const r = run(['shared', 'staging', String(sport)], { cwd: S1.dir, R: SR });
+  assert.equal(r.status, 0, r.out);
+  const rel = join(SR, 'releases', S1.sha);
+  for (const p of ['dist', 'server', 'src/shared', 'src/brand']) assert.ok(existsSync(join(rel, p)), p);
+  for (const d of ['src/shared', 'src/brand']) {
+    const diff = spawnSync('diff', ['-r', join(S1.dir, d), join(rel, d)], { encoding: 'utf8' });
+    assert.equal(diff.status, 0, `${d}: ${diff.stdout}`);
+  }
+  for (const p of ['src/shared/upi/parseUpiPayUri.mjs', 'src/shared/merchants.mjs', 'src/shared/money.mjs', 'src/shared/extra/new.mjs', 'src/brand/constants.ts']) {
+    assert.ok(existsSync(join(rel, p)), p);
+  }
+  assert.deepEqual(readdirSync(join(rel, 'src')).sort(), ['brand', 'shared']);
+  assert.equal(existsSync(join(rel, 'src', 'app')), false, 'src/app/App.tsx shipped');
+  assert.match(r.appended, /^· copy dist, server, src\/shared, src\/brand → releases\//m);
+  assert.doesNotMatch(r.out, /^closure: /m, 'valid closure prints nothing');
+});
+
+test('AC-53-02 server runs from release after source dir is deleted; no-session pay is 401', async () => {
+  rmSync(S1.dir, { recursive: true, force: true });
+  const h = await health(sport);
+  assert.equal(h.db, true);
+  assert.equal(h.sha, S1.sha);
+  assert.equal(h.mark, 'A');
+  const p = await postPay(sport);
+  assert.equal(p.status, 401, p.body);
+  assert.deepEqual(JSON.parse(p.body), { error: 'unauthenticated' });
+  const log = readFileSync(join(SR, 'server.log'), 'utf8');
+  assert.equal(log.split('\n').filter((l) => l.includes('ERR_MODULE_NOT_FOUND')).length, 0, log);
+});
+
+const closureCases = [
+  ['a', (d) => put(d, 'server/wallet/pay.mjs', `import '../../src/app/App.tsx';\n${readFileSync(join(OVERLAY, 'server/wallet/pay.mjs'), 'utf8')}`),
+    'closure: server/wallet/pay.mjs -> ../../src/app/App.tsx'],
+  ['b', (d) => put(d, 'server/x.mjs', "import { y } from '../../outside/y.mjs';\nexport { y };\n"), 'closure: server/x.mjs -> ../../outside/y.mjs'],
+  ['c', (d) => put(d, 'server/x.mjs', "export const z = () => import('../../src/lib/z.mjs');\n"), 'closure: server/x.mjs -> ../../src/lib/z.mjs'],
+  ['d', (d) => put(d, 'src/shared/merchants.mjs', `import '../app/App.tsx';\n${readFileSync(join(OVERLAY, 'src/shared/merchants.mjs'), 'utf8')}`),
+    'closure: src/shared/merchants.mjs -> ../app/App.tsx'],
+  ['e', (d) => symlinkSync('money.mjs', join(d, 'src/shared/link.mjs')), 'closure: src/shared/link.mjs -> symlink'],
+  ['f', (d) => put(d, 'src/brand/x.ts', "import { App } from '../app/App.tsx';\nexport const X: unknown = App;\n"), 'closure: src/brand/x.ts -> ../app/App.tsx'],
+];
+for (const [c, edit, want] of closureCases) {
+  test(`AC-53-03 closure guard fails before switch (${c})`, async () => {
+    const X = sharedCheckout(`bad-${c}`, edit);
+    const state = () => ['current', 'VERSION', 'server.pid'].map((f) => bytes(join(SR, f)));
+    const before = state();
+    const relBefore = releases(SR);
+    const r = run(['shared', 'staging', String(sport)], { cwd: X.dir, R: SR });
+    assert.equal(r.status, 1, r.out);
+    assert.deepEqual(r.stdout.split('\n').filter((l) => l.startsWith('closure: ')), [want]);
+    assert.match(r.appended, new RegExp(`^${want.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}$`, 'm'));
+    assert.match(r.appended, new RegExp(`^✗ import closure check failed for shared@${X.sha}; nothing switched$`, 'm'));
+    for (const s of ['· stop', '· start', '· probe']) assert.ok(!r.appended.includes(s), `${s} ran`);
+    assert.deepEqual(releases(SR), relBefore, 'releases/ changed (tmp left or rm/mv ran)');
+    assert.ok(!releases(SR).some((e) => e.startsWith('.tmp-')));
+    assert.deepEqual(state(), before);
+    assert.equal((await health(sport)).sha, S1.sha);
+  });
+}
+
+test('AC-53-03 closure guard passes a project with no src/shared or src/brand', async () => {
+  const NR = rootOf('nosrc', 'staging');
+  roots.push(NR);
+  const N = checkout('nosrc');
+  rmSync(join(N.dir, 'src'), { recursive: true, force: true });
+  const r = run(['nosrc', 'staging', String(await freePort())], { cwd: N.dir, R: NR });
+  assert.equal(r.status, 0, r.out);
+  assert.doesNotMatch(r.out, /^closure: /m);
+  assert.equal(existsSync(join(NR, 'releases', N.sha, 'src')), false);
+});
+
+test('AC-53-05 rollback to VERIFIED and prune carry src/shared', async () => {
+  const CR = rootOf('carry', 'staging');
+  roots.push(CR);
+  const cport = await freePort();
+  const CA = sharedCheckout('CA');
+  const CB = sharedCheckout('CB', (d) => put(d, 'src/shared/money.mjs', "export const MARK = 'B';\n"));
+  for (const X of [CA, CB]) assert.equal(run(['carry', 'staging', String(cport)], { cwd: X.dir, R: CR }).status, 0);
+  assert.equal((await health(cport)).mark, 'B');
+  writeFileSync(join(CR, 'VERIFIED'), `${CA.sha}\n`);
+  const r = run(['carry', 'staging', String(cport), '--rollback'], { R: CR });
+  assert.equal(r.status, 0, r.out);
+  assert.equal(sha256(join(CR, 'current', 'src', 'shared', 'money.mjs')), sha256(join(CR, 'releases', CA.sha, 'src', 'shared', 'money.mjs')));
+  const h = await health(cport);
+  assert.equal(h.sha, CA.sha);
+  assert.equal(h.mark, 'A');
+  assert.equal(findSrcDirs(CR), '');
+
+  // 7 deploys with VERIFIED on the 1st: the 5 newest plus VERIFIED stay; the 2nd is pruned with its src/*.
+  const PR = rootOf('prune', 'staging');
+  roots.push(PR);
+  const pport = await freePort();
+  const shas = [];
+  for (let i = 1; i <= 7; i += 1) {
+    const X = sharedCheckout(`P${i}`);
+    const rr = run(['prune', 'staging', String(pport)], { cwd: X.dir, R: PR });
+    assert.equal(rr.status, 0, rr.out);
+    shas.push(X.sha);
+    if (i === 1) writeFileSync(join(PR, 'VERIFIED'), `${X.sha}\n`);
+  }
+  assert.deepEqual(releases(PR), [shas[0], ...shas.slice(2)].sort());
+  assert.equal(existsSync(join(PR, 'releases', shas[1])), false, 'pruned release dir left behind');
+  for (const s of releases(PR)) {
+    for (const d of ['src/shared/money.mjs', 'src/brand/constants.ts']) assert.ok(existsSync(join(PR, 'releases', s, d)), `${s}/${d}`);
+  }
+  assert.equal(findSrcDirs(PR), '');
 });
