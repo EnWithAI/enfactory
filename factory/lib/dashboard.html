@@ -254,6 +254,16 @@ h2 small { text-transform: none; letter-spacing: 0; font-weight: 500; }
 .fbitem { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; }
 .fbitem .head { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 12.5px; color: var(--fg-3); }
 .fbitem .reply { font-size: 13.5px; color: var(--fg-2); border-left: 3px solid var(--border-strong); padding-left: 10px; }
+.fbitem.open { border-color: var(--border-strong); }
+.fbitem .proposal { background: var(--surface-alt); border-radius: 8px; padding: 10px 12px; font-size: 13.5px; display: flex; flex-direction: column; gap: 6px; }
+.fbitem .proposal b { font-size: 13px; }
+.fbitem .proposal code, .fbitem .proposal pre { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+.fbitem .proposal pre { margin: 0; white-space: pre-wrap; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; max-height: 180px; overflow: auto; }
+.fbitem .proposal .del { color: var(--err); } .fbitem .proposal .ins { color: var(--ok); }
+.fbitem textarea, .fbitem select { font: 400 13.5px var(--font); color: var(--fg); background: var(--surface); border: 1px solid var(--border-strong); border-radius: 8px; padding: 7px 9px; min-width: 0; }
+.fbitem textarea { width: 100%; min-height: 56px; resize: vertical; box-sizing: border-box; }
+.fbitem .working { font-size: 13px; color: var(--info); }
+#fb-badge { font-size: 11px; font-weight: 800; background: var(--warn); color: var(--surface); border-radius: 9999px; padding: 0 7px; margin-left: 6px; }
 
 /* org chart */
 .askbtn.ghost { background: transparent; color: var(--fg); box-shadow: inset 0 0 0 1.5px var(--border-strong); }
@@ -419,7 +429,7 @@ dialog::backdrop { background: var(--scrim); }
   <a class="waitpill" id="wait-pill" href="#waiting" hidden></a>
   <button type="button" class="askbtn ghost" id="run-org" hidden>Pause</button>
   <button type="button" class="askbtn" id="cr-open">Client room<span id="cr-badge" hidden>your turn</span></button>
-  <button type="button" class="askbtn ghost" id="fb-open">Feedback box</button>
+  <button type="button" class="askbtn ghost" id="fb-open">Feedback box<span id="fb-badge" hidden></span></button>
   <button type="button" class="askbtn ghost" id="org-open">Org chart</button>
   <button type="button" class="askbtn" id="ask-open">Ask the org<span id="ask-badge" hidden></span></button>
   <span class="live" id="live"><i></i><span>Live</span></span>
@@ -960,17 +970,89 @@ loadClient(); setInterval(loadClient, 15000);
 if (location.hash === '#client') $('cr-open').click();
 
 // ── request and complaint box ──
+// What a proposed fix will change, shown before the owner applies it.
+function fixDetail(f) {
+  if (f.kind === 'grant_tools') return el('div', {}, `Grant `, el('b', {}, pretty(f.role)), ': ', ...f.tools.flatMap((t, k) => [k ? ', ' : '', el('code', {}, t)]));
+  if (f.kind === 'scoped_write') return el('div', {}, `Let `, el('b', {}, pretty(f.role)), ' write and edit: ', ...f.paths.flatMap((t, k) => [k ? ', ' : '', el('code', {}, t)]));
+  if (f.kind === 'lint_family') return el('div', {}, 'Add spec_lint families: ', ...f.families.flatMap((t, k) => [k ? ', ' : '', el('code', {}, t)]));
+  if (f.kind === 'lesson') return el('div', {}, `Lesson for ${f.role === 'all' ? 'every role' : pretty(f.role)}: `, f.text);
+  if (f.kind === 'doc_edit') return el('div', {}, 'Edit ', el('code', {}, f.file), el('pre', {}, el('span', { class: 'del' }, `− ${f.find}`), '\n', el('span', { class: 'ins' }, `+ ${f.replace}`)));
+  if (f.kind === 'factory_code') return el('pre', {}, f.brief);
+  return null;
+}
+async function fbAct(i, action, extra = {}) {
+  const r = await fetch('/api/feedback/act', { method: 'POST', headers: { 'content-type': 'application/json', 'x-factory-ask': '1' }, body: JSON.stringify({ id: i.id, action, ...extra }) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error ?? 'refused');
+  return j;
+}
+// The actions on one open item: handle now, apply or decline a proposal, copy a factory-code brief, or resolve it yourself.
+function fbActions(i, handling) {
+  if (i.status !== 'open') return null;
+  if (handling) return el('div', { class: 'working', role: 'status' }, 'The chief of staff is reviewing this now. The answer appears here in about a minute.');
+  const note = el('textarea', { 'aria-label': 'Your reply to whoever filed it', placeholder: 'Your reply (required to decline or resolve; optional when applying)' });
+  const msg = el('span', { class: 'msg', role: 'status', 'aria-live': 'polite' });
+  const run = (btn, fn) => async () => {
+    btn.disabled = true; msg.className = 'msg'; msg.textContent = 'Working…';
+    try { await fn(); await loadFeedback(); } catch (e) { msg.className = 'msg err'; msg.textContent = e.message; btn.disabled = false; }
+  };
+  const decline = el('button', { type: 'button' }, 'Decline');
+  decline.onclick = run(decline, () => fbAct(i, 'decline', { text: note.value }));
+  const pr = i.proposal;
+  if (pr) {
+    const code = pr.fix.kind === 'factory_code';
+    const box = el('div', { class: 'proposal' },
+      el('div', {}, el('b', {}, code ? 'Needs factory code' : pr.invalid ? 'Proposed fix (can’t be applied from here)' : `Proposed fix: ${pr.summary}`), ' ',
+        el('span', { class: `pill ${code || pr.invalid ? 'warn' : 'info'}` }, pr.outcome)),
+      el('div', {}, pr.reply), fixDetail(pr.fix), pr.invalid ? el('div', { class: 'muted' }, pr.invalid) : null);
+    const buttons = [];
+    if (code) {
+      const copy = el('button', { type: 'button', class: 'primary' }, 'Copy brief for Claude Code');
+      copy.onclick = async () => {
+        const text = `Factory change requested from the feedback box (item ${i.id}, ${i.kind} from ${i.by} about ${i.about}${i.issue ? `, #${i.issue}` : ''}).\n\n${pr.fix.brief}\n\nEvidence from the filer: ${i.evidence || 'none given'}\nWhen it's done, resolve item ${i.id} in the dashboard's Feedback box.`;
+        try { await navigator.clipboard.writeText(text); msg.className = 'msg'; msg.textContent = 'Copied. Paste it into Claude Code in this factory folder.'; }
+        catch { msg.className = 'msg err'; msg.textContent = 'Copy was blocked by the browser; select the brief above and copy it.'; }
+      };
+      buttons.push(copy);
+    } else if (!pr.invalid) {
+      const ok = el('button', { type: 'button', class: 'primary' }, 'Apply');
+      ok.onclick = run(ok, () => fbAct(i, 'apply', { text: note.value }));
+      buttons.push(ok);
+    }
+    const again = el('button', { type: 'button' }, 'Ask again');
+    again.onclick = run(again, () => fbAct(i, 'handle'));
+    const done = el('button', { type: 'button' }, 'Mark resolved');
+    done.onclick = run(done, () => fbAct(i, 'resolve', { outcome: pr.outcome, text: note.value || pr.reply }));
+    return el('div', {}, box, note, el('div', { class: 'wactions' }, ...buttons, ...(code || pr.invalid ? [done] : []), decline, again, msg));
+  }
+  const handle = el('button', { type: 'button', class: 'primary' }, 'Handle now');
+  handle.onclick = run(handle, () => fbAct(i, 'handle'));
+  const outcome = el('select', { 'aria-label': 'Outcome' }, ...(i.kind === 'complaint' ? ['upheld', 'partly upheld', 'dismissed'] : ['request accepted', 'request declined'])
+    .map((o) => el('option', { value: o }, o)));
+  const resolve = el('button', { type: 'button' }, 'Resolve myself');
+  resolve.onclick = run(resolve, () => fbAct(i, 'resolve', { outcome: outcome.value, text: note.value }));
+  return el('div', {}, note, el('div', { class: 'wactions' }, handle, outcome, resolve, decline, msg));
+}
+let fbTimer = null;
 async function loadFeedback() {
   let d; try { d = await (await fetch('/api/feedback')).json(); } catch { $('fb-list').replaceChildren(el('div', { class: 'muted' }, 'Could not reach the dashboard server.')); return; }
   if ($('fb-about').options.length === 0) $('fb-about').replaceChildren(el('option', { value: 'org' }, 'The org (a rule, process or tool)'), ...d.roles.map((r) => el('option', { value: r }, pretty(r))));
-  $('fb-list').replaceChildren(...(d.items.length ? d.items.map((i) => el('div', { class: 'fbitem' },
+  const handling = new Set(d.handling ?? []);
+  const items = [...d.items].sort((a, b) => (a.status === 'open' ? 0 : 1) - (b.status === 'open' ? 0 : 1) || String(b.at).localeCompare(String(a.at)));
+  // Don't redraw under someone typing a reply.
+  if (document.activeElement?.closest?.('#fb-list') && document.activeElement.tagName === 'TEXTAREA' && !handling.size) return;
+  $('fb-list').replaceChildren(...(items.length ? items.map((i) => el('div', { class: `fbitem ${i.status === 'open' ? 'open' : ''}` },
     el('div', { class: 'head' }, el('span', { class: `pill ${i.kind === 'complaint' ? 'warn' : 'info'}` }, i.kind),
       el('span', {}, `about ${i.about === 'org' ? 'the org' : pretty(i.about)}`), el('span', {}, `from ${i.by === 'person' ? 'a person' : pretty(i.by)}`),
       i.issue ? el('span', { class: 'pill' }, `#${i.issue}`) : null, el('span', {}, `${ago(i.at)} ago`),
-      el('span', { class: `pill ${i.status === 'open' ? '' : /upheld|accepted/.test(i.outcome) ? 'ok' : ''}` }, i.status === 'open' ? 'open' : i.outcome)),
+      i.seconded?.length ? el('span', { class: 'pill' }, `+${i.seconded.length}`) : null,
+      el('span', { class: `pill ${i.status === 'open' ? (i.proposal ? 'info' : '') : /upheld|accepted/.test(i.outcome) ? 'ok' : ''}` }, i.status === 'open' ? (i.proposal ? 'fix proposed' : 'open') : i.outcome)),
     el('div', {}, i.text), i.evidence ? el('div', { class: 'muted', style: 'font-size:12.5px' }, `Evidence: ${i.evidence}`) : null,
-    i.reply ? el('div', { class: 'reply' }, `${i.action && i.action !== 'none' ? `Action: ${i.action}. ` : ''}${i.reply}`) : null))
+    i.status !== 'open' && i.reply ? el('div', { class: 'reply' }, `${i.action && i.action !== 'none' ? `Action: ${i.action}. ` : ''}${i.reply}`) : null,
+    fbActions(i, handling.has(i.id))))
     : [el('div', { class: 'quiet' }, 'The box is empty. Nobody has filed anything yet.')]));
+  clearTimeout(fbTimer);
+  if (handling.size && $('fbbox').open) fbTimer = setTimeout(loadFeedback, 4000); // follow the chief of staff's review
 }
 $('fb-open').onclick = () => { $('fbbox').showModal(); loadFeedback(); };
 $('fb-close').onclick = () => $('fbbox').close();
@@ -981,7 +1063,7 @@ $('fb-form').addEventListener('submit', async (e) => {
     const r = await fetch('/api/feedback', { method: 'POST', headers: { 'content-type': 'application/json', 'x-factory-ask': '1' },
       body: JSON.stringify({ about: $('fb-about').value, kind: $('fb-kind').value, text: $('fb-text').value, evidence: $('fb-ev').value }) });
     const j = await r.json(); if (!r.ok) throw new Error(j.error ?? 'refused');
-    $('fb-text').value = ''; $('fb-ev').value = ''; $('fb-msg').textContent = `Filed (${j.id}). The chief of staff reviews open items every few hours.`;
+    $('fb-text').value = ''; $('fb-ev').value = ''; $('fb-msg').textContent = `Filed (${j.id}). Click "Handle now" on it for a review straight away, or the chief of staff picks it up in the next pass.`;
     loadFeedback();
   } catch (err) { $('fb-msg').className = 'msg err'; $('fb-msg').textContent = `${err.message}. Nothing was filed.`; }
 });
@@ -1340,6 +1422,9 @@ async function refresh() {
   bump('k-genesis', s.stats.genesis); bump('k-working', s.running.length); bump('k-cost', `$${s.stats.costToday.toFixed(2)}`);
   $('k-cost').title = `daily budget $${s.stats.budget} · total $${s.stats.costTotal.toFixed(2)}`;
   bump('k-runs', s.stats.runs); bump('k-dec', s.stats.decisions);
+  const fb = s.feedback ?? { open: 0, proposed: 0 }; // open items in the request and complaint box, so they don't pile up unseen
+  $('fb-badge').hidden = !fb.open; $('fb-badge').textContent = String(fb.open);
+  $('fb-open').title = fb.open ? `${fb.open} open item${fb.open > 1 ? 's' : ''}${fb.proposed ? `, ${fb.proposed} with a fix ready to apply` : ''}` : 'No open items';
   if (window.BUILD && s.build && s.build !== window.BUILD && !document.querySelector('dialog[open]')) return location.reload(); // new dashboard code
   window.BUILD ??= s.build;
   lastState = s; GENS = s.generations ?? {};

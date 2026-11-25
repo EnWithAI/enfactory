@@ -25,7 +25,9 @@ export async function council({ cfg, name, topic, context, chair, members, round
   for (let round = 1; round <= rounds; round++) {
     const results = await Promise.all(members.map((role) => runAgent({
       cfg, role, cwd, issue, label: `council-${role}`, schema: nextOptions ? { ...POSITION, properties: { ...POSITION.properties, recommended_next: { enum: nextOptions } } } : POSITION,
-      prompt: `# Council: ${topic}\nYou are the ${role} on this council. Chair: ${chair}.\n\n## Context\n${context}\n\n` +
+      prompt: `# Council: ${topic}\nYou are the ${role} on this council. Chair: ${chair}.\n` +
+        (cwd ? `To check evidence yourself, run read-only git commands directly in your working directory (${cwd}): git log, git diff, git show, git status, git branch -r. Don't use git -C or cd; those forms are denied.\n` : '') +
+        `\n## Context\n${context}\n\n` +
         (transcript.length ? `## Discussion so far\n${render()}\n\nThis is round ${round}. Respond to the others. Converge where you can, and hold firm where your domain requires it.\n`
           : 'This is round 1. Give your independent position from your domain.\n') +
         (nextOptions ? `\nThe routes the council can choose: ${nextOptions.join(', ')}.\n` : ''),

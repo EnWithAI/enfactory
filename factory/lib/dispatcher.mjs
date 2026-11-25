@@ -42,6 +42,7 @@ export class Dispatcher {
       build: {
         pr_draft: { type: 'boolean', description: 'true while anything is provisional or pending (e.g. a mirrored ADR awaiting security). The PR stays a draft and cannot merge.' },
         pr_body: { type: 'string', description: 'The PR description, used verbatim (prefixed with "Part of #n"). Put lines acceptance criteria check for here.' },
+        no_code_change: { type: 'boolean', description: 'true only when the tech design explicitly calls for no product-repo change (e.g. a factory, memory or doc-only change). The issue then goes through review and security without a PR and closes at merge.' },
       },
       'tech-grooming': { risk_tier: { enum: ['low', 'medium', 'high'] }, repos: { type: 'array', items: { enum: names }, description: 'Every repo this change touches.' } },
       release: { deploy_now: { type: 'boolean' }, environment: { enum: this.envs }, hold_minutes: { type: 'number' } },
@@ -100,6 +101,12 @@ export class Dispatcher {
       if (rel?.status === 'active' && rel.issues.length && rel.issues.every((n) => !openNums.has(n))) this.releaseJob('closeOut', () => import('./release.mjs').then((R) => R.closeOut(cfg)));
       else if ((!rel || rel.status === 'done') && budgetLeft > 0 && !eng?.releases) this.releaseJob('plan', () => import('./release.mjs').then((R) => R.plan(cfg, issues))); // with an engagement plan, releases come from the plan
     }
+    // Current spend, where agents can read it (feedback d17f145f): spend-based rules in a plan can be checked, not guessed.
+    const relIssues = new Set(rel?.issues ?? []);
+    this.spend = { today_usd: +(cfg.capacity.daily_budget_usd - budgetLeft).toFixed(2), daily_budget_usd: cfg.capacity.daily_budget_usd ?? null,
+      release: rel?.number ?? null, release_usd: +M.events().filter((e) => e.type === 'run_finished' && relIssues.has(Number(e.issue))).reduce((s, e) => s + (e.cost_usd ?? 0), 0).toFixed(2),
+      at: now().toISOString() };
+    M.kv('spend', this.spend);
     const open = new Set(issues.map((i) => i.number));
     for (const f of existsSync(p('memory/state')) ? readdirSync(p('memory/state')).filter((f) => /^issue-\d+\.json$/.test(f)) : []) {
       const n = Number(f.match(/\d+/)[0]), st = M.issueState(n);
@@ -132,6 +139,12 @@ export class Dispatcher {
       if (!st) continue; // done/rejected or a hand-applied label
       const state = M.issueState(n);
       if (state.holdUntil && new Date(state.holdUntil) > now()) continue;
+      if (state.waitFor?.length) { // parked on planned dependencies: free until each has merged or closed
+        const still = state.waitFor.filter((m) => open.has(m) && !Object.keys(M.issueState(m).merged ?? {}).length);
+        if (still.length) continue;
+        M.record('dependency_ready', { stage, waited_for: state.waitFor }, { issue: n });
+        state.waitFor = null; M.saveIssueState(n, state);
+      }
       if (releaseMode) {
         const inScope = rel?.status === 'active' && rel.issues.includes(n);
         const expedite = (cfg.delivery.expedite ?? ['P0']).includes(T.priorityOf(issue));
@@ -243,7 +256,21 @@ export class Dispatcher {
     const schema = verdictSchema(st.next, this.extra(stage));
     issue.comments ??= await T.viewIssue(this.repo, n).then((i) => i.comments).catch(() => []); // people's words go in the brief
     M.snapshotArtifact(n, stage); // the agent may rewrite its artifact file during the run; keep the version it starts from
-    if (['review', 'security'].includes(stage) && Object.keys(state.prs ?? {}).length) issue.ci = await this.ciGate(state, 0).catch(() => null); // owner request #50
+    if (['review', 'security'].includes(stage) && Object.keys(state.prs ?? {}).length) {
+      // A parent PR merged (often squashed) under this one: rebase first, rather than review code that can't merge (feedback b81be2c4).
+      const conflicts = [];
+      for (const [name, pr] of Object.entries(state.prs)) {
+        if (!state.merged?.[name] && (await T.prMergeable(this.repoByName(name).repo, pr).catch(() => null)) === 'CONFLICTING') conflicts.push(name);
+      }
+      if (conflicts.length) {
+        state.lastHandoff = { from: stage, by: 'git', text: `The PR(s) now conflict with the default branch in: ${conflicts.join(', ')} (an earlier PR merged underneath). In each, run \`git fetch origin && git rebase origin/<default>\`, resolve the conflicts keeping both changes' intent, re-run all tests, commit and hand back to review.` };
+        M.saveIssueState(n, state);
+        M.record('transition', { stage, to: 'build', outcome: 'loop_back', loop: false, kind: 'rebase_needed', summary: `PR conflicts after a parent merge: ${conflicts}` }, { actor: 'git', issue: n });
+        await T.comment(this.repo, n, `### 🔁 PR conflicts with the default branch (${conflicts.join(', ')}): back to \`build\` to rebase before \`${stage}\``);
+        return this.move(issue, stage, 'build', state);
+      }
+      issue.ci = await this.ciGate(state, 0).catch(() => null); // owner request #50: reviewers see the PR's checks
+    }
     const context = this.context(issue, stage, state, cwd);
 
     let res;
@@ -300,7 +327,18 @@ export class Dispatcher {
     const v = res.out;
     const role = st.council ? st.council.chair : this.pickRole(stage, st, state);
     const order = STAGE_ORDER(cfg);
-    let next = v.outcome === 'blocked' ? 'blocked' : v.next_stage;
+    // A planned dependency (feedback 4ef8402c): park the issue at this stage until the named issues merge or close. No council.
+    const deps = v.outcome === 'wait' ? [...new Set((v.wait_for ?? []).map(Number).filter((m) => m && m !== n))] : [];
+    if (deps.length) {
+      if (v.artifact_markdown?.trim()) M.saveArtifact(n, stage, this.artifactOf(n, stage, res));
+      for (const d of v.decisions ?? []) M.decide(d, { actor: role, issue: n });
+      state.waitFor = deps; state.lastHandoff = { from: stage, by: role, text: v.handoff };
+      M.saveIssueState(n, state);
+      M.record('waiting', { reason: 'dependency', stage, wait_for: deps, summary: v.summary?.slice(0, 500), cost_usd: res.cost }, { actor: role, issue: n });
+      await T.comment(repo, n, `### ⏸️ ${role} · \`${stage}\` waits for ${deps.map((d) => `#${d}`).join(', ')}\n${v.summary}\n\nThis resumes at \`${stage}\` by itself once ${deps.length > 1 ? 'each has' : 'it has'} merged or closed.`);
+      return;
+    }
+    let next = v.outcome === 'blocked' || v.outcome === 'wait' ? 'blocked' : v.next_stage; // `wait` without issues to wait for is a block
     // Council stages route rather than loop, and `forward` targets (verify → release = promote) are progress.
     const isLoop = !st.council && !(st.forward ?? []).includes(next) && order.includes(next) && order.indexOf(next) < order.indexOf(stage);
 
@@ -374,7 +412,11 @@ export class Dispatcher {
     ].join('\n'));
 
     // Stage side effects
-    if (stage === 'build' && next === 'review' && !(await this.publish(issue, state, v))) next = 'blocked';
+    if (stage === 'build' && next === 'review' && !(await this.publish(issue, state, v))) {
+      // No product-repo commits. Allowed when the tech design says so (feedback a612e8eb); otherwise the build is incomplete.
+      if (v.no_code_change && !Object.keys(state.prs ?? {}).length) { state.noCode = true; M.saveIssueState(n, state); M.record('no_code_change', { summary: v.summary?.slice(0, 300) }, { actor: role, issue: n }); }
+      else next = 'blocked';
+    }
     if (['review', 'security'].includes(stage)) {
       for (const [name, pr] of Object.entries(state.prs ?? {})) {
         await T.prComment(this.repoByName(name).repo, pr, `### ${role}: ${next === 'merge' || next === 'security' ? '✅' : '❌'}\n${v.summary}`);
@@ -533,7 +575,13 @@ export class Dispatcher {
     const { cfg, repo } = this;
     const n = issue.number;
     const prs = Object.entries(state.prs ?? {}).filter(([name]) => !state.merged?.[name]);
-    if (!Object.keys(state.prs ?? {}).length) return this.escalate(n, state, 'build', 'Reached merge with no PRs recorded.');
+    if (!Object.keys(state.prs ?? {}).length) {
+      if (state.noCode) { // reviewed and security-checked work with no product code to merge or deploy
+        await T.comment(repo, n, `### ✅ No product code to merge: the change is outside the product repos, as the tech design planned. Closing.`);
+        return this.move(issue, 'merge', 'done', state);
+      }
+      return this.escalate(n, state, 'build', 'Reached merge with no PRs recorded.');
+    }
     const gate = cfg.gates?.merge_by_risk?.[state.risk ?? 'medium'] ?? 'auto';
     if (gate !== 'auto' && !state.mergeApproved) { // second-person approval by role
       const a = await this.approval(issue, 'merge', gate, 'release', null, state);
@@ -865,6 +913,7 @@ export class Dispatcher {
       `## Issue body`, issue.body || '_(empty)_', '',
       `## Factory state`,
       `priority=${T.priorityOf(issue)} risk=${state.risk ?? 'unset'} loops=${state.loops} repos=${this.touched(state).map((r) => r.name).join(',')} prs=${this.prList(state) || 'none'} deployed=${JSON.stringify(state.deployed ?? {})}`,
+      this.spend ? `spend: today $${this.spend.today_usd} of $${this.spend.daily_budget_usd} daily budget${this.spend.release ? ` · Release ${this.spend.release} so far $${this.spend.release_usd}` : ''} (as of ${this.spend.at.slice(11, 16)} UTC; also in ${p('memory/state/spend.json')})` : '',
       ...(() => { const A = this.answersLatest ?? []; return A.length ? [`\n## Owner answers (newest first; these override answers.md and any earlier assumption)`,
         ...A.map((a) => `- **#${a.request}** (${a.ts.slice(0, 16).replace('T', ' ')} UTC): ${a.text.replace(/\s+/g, ' ').slice(0, 300)}`)] : []; })(),
       state.lastHandoff ? `\n## Handoff to you from ${state.lastHandoff.by} (${state.lastHandoff.from})\n${state.lastHandoff.text}` : '',
@@ -892,7 +941,7 @@ export class Dispatcher {
         `Don't re-read them or re-run \`gh issue view\` and \`sf memory issue\`. Spend your steps on the work itself; read the full documents only for a specific gap.`,
       lint,
       `\n## Choose next_stage from`, opts,
-      `\nUse \`advance\` to move forward, \`loop_back\` to send work upstream (say exactly what must change in \`handoff\`), \`reject\` to close, and \`blocked\` to ask a human.`,
+      `\nUse \`advance\` to move forward, \`loop_back\` to send work upstream (say exactly what must change in \`handoff\`), \`reject\` to close, \`wait\` with \`wait_for\` when the plan says this issue must wait for other issues (no council; it resumes by itself), and \`blocked\` only when a decision is needed.`,
       `Put the full stage artifact in \`artifact_markdown\`.`,
     ].join('\n');
   }

@@ -10,6 +10,7 @@ import { events, record, writeDoc, decide } from './memory.mjs';
 import { runAgent } from './worker.mjs';
 import { createIssue, gh, humanComment, editLabels, closeIssue, MARK } from './tracker.mjs';
 import { tree as libraryTree } from './library.mjs';
+import { list as feedbackList } from './hr.mjs';
 
 export const DEFAULT_PORT = 4340;
 const list = (dir, ext = '.md') => (existsSync(p(dir)) ? readdirSync(p(dir)).filter((f) => f.endsWith(ext)).sort() : []);
@@ -174,6 +175,7 @@ function state() {
     company: cfg.company?.name, product: cfg.product.name, tracker: cfg.product.tracker, repos: cfg.product.repos.map((r) => r.repo),
     build: statSync(new URL('./dashboard.html', import.meta.url)).mtimeMs,
     delivery: cfg.delivery ?? null, release: existsSync(p('memory/state/release.json')) ? JSON.parse(readFileSync(p('memory/state/release.json'), 'utf8')) : null, departments: cfg.departments ?? {}, stages: Object.keys(cfg.pipeline), stageRoles: Object.fromEntries(Object.entries(cfg.pipeline).map(([k, v]) => [k, v.role ?? v.council?.chair ?? 'dispatcher'])), handoffs, people: cfg.people ?? [], teams, running, issues: Object.values(issues), feed,
+    feedback: (() => { const open = feedbackList().filter((i) => i.status === 'open'); return { open: open.length, proposed: open.filter((i) => i.proposal).length }; })(),
     spend: spend(evs), decisions: adrs(), docs: docs(), library: (() => { try { return libraryTree(); } catch { return []; } })(), generations: existsSync(p('memory/state/generations.json')) ? JSON.parse(readFileSync(p('memory/state/generations.json'), 'utf8')) : {},
     hiredRoles: [...new Set(evs.filter((e) => e.type === 'hired' && e.team).map((e) => e.role))],
     stats: {
@@ -335,6 +337,24 @@ async function act({ n, action, text }) {
   await import('./answers.mjs').then((A) => A.sync(cfg)).catch(() => {}); // the answer reaches answers.md now, not on the next sweep
   return loadWaiting(true);
 }
+// ── the request and complaint box: the owner acts on items here ──
+const handling = new Map(); // item id -> started, while the chief of staff reviews it on request
+async function feedbackAct({ id, action, text, outcome }) {
+  const H = await import('./hr.mjs');
+  const by = loadConfig().people?.find((x) => x.owner)?.login ?? 'owner';
+  if (action === 'handle') {
+    if (handling.has(id)) return { handling: true };
+    handling.set(id, Date.now());
+    H.review(loadConfig(), { ids: [id] }).catch((e) => record('feedback_review_failed', { item: id, error: e.message.slice(0, 300) }, { actor: 'chief-of-staff' }))
+      .finally(() => handling.delete(id));
+    return { handling: true };
+  }
+  if (action === 'apply') return H.applyProposal(id, { by, reply: text ?? '' });
+  if (action === 'decline') return H.decline(id, { by, reason: text });
+  if (action === 'resolve') return H.resolve(id, { by, outcome, reply: text });
+  throw new Error('unknown action');
+}
+
 // ── the dispatcher: is the org working, and start it from here so nobody needs a terminal ──
 function dispatcher() {
   const lock = p('.factory/dispatcher.pid');
@@ -418,7 +438,11 @@ export function serve(port = DEFAULT_PORT, { explicit = false } = {}) {
       }
       if (url.pathname === '/api/feedback' && req.method === 'GET') {
         const H = await import('./hr.mjs');
-        res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify({ items: H.list(), roles: Object.keys(loadConfig().roles) }));
+        res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify({ items: H.list(), roles: Object.keys(loadConfig().roles), handling: [...handling.keys()] }));
+      }
+      if (url.pathname === '/api/feedback/act' && req.method === 'POST') {
+        if (!trusted(req)) return json({ error: 'Refused: only this dashboard can act on the box.' }, 403);
+        return body(req).then(async (b) => json(await feedbackAct(JSON.parse(b || '{}')))).catch((e) => json({ error: e.message }, 400));
       }
       if (url.pathname === '/api/feedback' && req.method === 'POST') {
         if (!trusted(req)) { res.statusCode = 403; res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify({ error: 'Refused: only this dashboard can file feedback.' })); }

@@ -27,7 +27,9 @@ export function verdictSchema(nextOptions, extra = {}) {
   return {
     type: 'object',
     properties: {
-      outcome: { enum: ['advance', 'loop_back', 'reject', 'blocked', 'needs_vendor'] },
+      outcome: { enum: ['advance', 'loop_back', 'reject', 'blocked', 'needs_vendor', 'wait'] },
+      wait_for: { type: 'array', items: { type: 'number' }, description: 'With outcome `wait`: the issue numbers this one depends on, as the plan already says. ' +
+        'The issue is parked, with no council, and resumes at this stage once each one has merged or closed.' },
       next_stage: { enum: [...nextOptions, 'blocked'] },
       summary: { type: 'string', description: 'What you did and found, for the issue thread (markdown, concise).' },
       handoff: { type: 'string', description: 'Exact instructions for the agent that receives this next.' },

@@ -5,7 +5,11 @@ import { p } from './config.mjs';
 import { events } from './memory.mjs';
 const answeredRequests = () => new Map(events().filter((e) => e.type === 'answer_recorded').map((e) => [Number(e.request), e.text]));
 
-const CMD = /`\s*(git|grep|rg|diff|npm|npx|node|test|ls|cat|jq|sed|awk|sh|bash|find|wc|head|tail|curl|sf)\b[^`]*`/;
+// gh counts only in read-only forms (feedback ae04a2f3): the ones read-only roles may run, so a doc AC can be dry-run exactly as
+// written. A mutating command (gh issue close, gh pr merge…) is never a verify step.
+const GH_READ = String.raw`gh\s+(?:(?:issue|pr|run|repo|release)\s+(?:view|list|checks|diff)|api\s+-X\s+GET)\b`;
+const CMD = new RegExp(String.raw`\`\s*(?:(?:git|grep|rg|diff|npm|npx|node|test|ls|cat|jq|sed|awk|sh|bash|find|wc|head|tail|curl|sf)\b|${GH_READ})[^\`]*\``);
+const GH_ANY = /`\s*gh\s[^`]*`/;
 const split = (v) => String(v ?? '').toLowerCase().split(/[+,|/]|\s+and\s+/).map((x) => x.replace(/[`*\[\]]/g, '').trim()).filter(Boolean);
 
 /** Sections by their "## n." heading number (or name), with their text. */
@@ -80,7 +84,9 @@ export function specLint(md, cfg) {
     if (!a.verify.length) failures.push(`${a.id}: no verify method.`);
     for (const v of a.verify) if (verifies.size && !verifies.has(v)) failures.push(`${a.id}: verify "${v}" is not one of ${[...verifies].join(', ')}.`);
     // (3) a doc check states the command that proves it
-    if (a.verify.includes('doc') && !CMD.test(a.line)) failures.push(`${a.id}: verify doc needs the exact command in backticks (e.g. \`git show <S>:path | grep …\`).`);
+    if (a.verify.includes('doc') && !CMD.test(a.line)) failures.push(GH_ANY.test(a.line)
+      ? `${a.id}: verify doc uses a gh command that isn't read-only. Use gh issue|pr|run|repo|release view|list|checks|diff, or gh api -X GET.`
+      : `${a.id}: verify doc needs the exact command in backticks (e.g. \`git show <S>:path | grep …\` or \`gh issue view <n> --comments\`).`);
   }
   // (5) every success metric names its data source (owner request #15)
   const lines = md.split('\n');
