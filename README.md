@@ -25,7 +25,7 @@ One install runs one company working on one product at a time. The agents run on
 staging and production on your own computer.
 
 ```bash
-git clone https://github.com/maathavan-enwithai/enfactory.git my-factory
+git clone https://github.com/EnWithAI/enfactory.git my-factory
 cd my-factory
 npm install
 bin/sf dashboard            # open http://127.0.0.1:4340
