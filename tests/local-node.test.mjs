@@ -505,3 +505,88 @@ test('AC-53-05 rollback to VERIFIED and prune carry src/shared', async () => {
   }
   assert.equal(findSrcDirs(PR), '');
 });
+
+// #110: #3's server CLI is `server/index.mjs <port> <dataDir>`. The fixture reads the port and data dir from argv only, so
+// these tests go red if the script stops passing them. Each test uses its own SF_ENV_ROOT so the #64 root above is untouched.
+const rootIn = (envRoot) => join(envRoot, 'enwallet', 'staging');
+const deployTraced = (envRoot, repo, p, extra = [], env = {}) => {
+  const Rx = rootIn(envRoot);
+  if (!roots.includes(Rx)) roots.push(Rx);
+  const trace = join(T, `trace-${roots.length}-${Math.random().toString(36).slice(2)}.json`);
+  const r = run(['enwallet', 'staging', String(p), ...extra], { cwd: repo?.dir ?? T, R: Rx, env: { SF_ENV_ROOT: envRoot, FIXTURE_TRACE: trace, ...env } });
+  assert.equal(r.status, 0, r.out);
+  return JSON.parse(readFileSync(trace, 'utf8'));
+};
+let p110, R110, C;
+
+test('AC-110-01 starts server with positional <port> <dataDir>', async () => {
+  const envRoot = join(T, 'envs-110');
+  R110 = rootIn(envRoot);
+  p110 = await freePort();
+  C = checkout('110-C');
+  const t = deployTraced(envRoot, C, p110);
+  assert.equal(t.argv[0], String(p110));
+  assert.equal(t.argv[1], join(R110, 'data'));
+  assert.equal(t.argv1, join(R110, 'current', 'server', 'index.mjs'));
+  assert.equal((await health(p110)).sha, C.sha);
+});
+
+test('AC-110-02 env vars kept alongside argv', () => {
+  const t = deployTraced(join(T, 'envs-110'), C, p110);
+  assert.deepEqual(
+    { HOST: t.HOST, PORT: t.PORT, ENWALLET_DB: t.ENWALLET_DB, ENWALLET_SHA: t.ENWALLET_SHA },
+    { HOST: '127.0.0.1', PORT: String(p110), ENWALLET_DB: join(R110, 'data', 'enwallet.db'), ENWALLET_SHA: C.sha },
+  );
+});
+
+test('AC-110-03 argv-only stub exits 2 without argv', async () => {
+  const p = await freePort();
+  const r = spawnSync(process.execPath, [join(FIXTURE, 'server', 'index.mjs')], {
+    env: baseEnv({ HOST: '127.0.0.1', PORT: String(p), ENWALLET_DB: join(T, 'nodata', 'enwallet.db') }), encoding: 'utf8', timeout: 10_000,
+  });
+  assert.equal(r.status, 2, r.stdout + r.stderr);
+  assert.match(r.stderr, /usage: index\.mjs <port> <dataDir>/);
+  const refused = await new Promise((res) => {
+    get({ host: '127.0.0.1', port: p, path: '/api/health', agent: false }, () => res(false)).on('error', () => res(true));
+  });
+  assert.ok(refused, `something listened on ${p}`);
+  // The stub's listen and data paths come only from argv (AC-110-10 greps the same file).
+  const src = readFileSync(join(FIXTURE, 'server', 'index.mjs'), 'utf8');
+  assert.doesNotMatch(src, /listen\(\s*Number\(PORT\)/);
+});
+
+test('AC-110-04 single 127.0.0.1 listener', () => {
+  const lsof = spawnSync('lsof', ['-nP', `-iTCP:${p110}`, '-sTCP:LISTEN'], { encoding: 'utf8' }).stdout.trim().split('\n').slice(1);
+  assert.equal(lsof.length, 1, lsof.join('\n'));
+  assert.match(lsof[0], new RegExp(`127\\.0\\.0\\.1:${p110} \\(LISTEN\\)`));
+});
+
+test('AC-110-05 dataDir persists across deploy and rollback', async () => {
+  const envRoot = join(T, 'envs-110-persist');
+  const Rp = rootIn(envRoot);
+  const p = await freePort();
+  const D = checkout('110-D'), E = checkout('110-E');
+  const marker = join(Rp, 'data', 'fixture-marker');
+  const tA = deployTraced(envRoot, D, p, [], { FIXTURE_MARKER: '1' });
+  const markerBytes = readFileSync(marker, 'utf8');
+  const tB = deployTraced(envRoot, E, p, [], { FIXTURE_MARKER: '1' });
+  writeFileSync(join(Rp, 'VERIFIED'), `${D.sha}\n`);
+  const tR = deployTraced(envRoot, null, p, ['--rollback'], { FIXTURE_MARKER: '1' });
+  for (const t of [tA, tB, tR]) {
+    assert.equal(t.argv[1], join(Rp, 'data'));
+    assert.ok(t.argv[1].startsWith('/'), t.argv[1]);
+    assert.ok(!t.argv[1].includes('/releases/'), t.argv[1]);
+  }
+  assert.equal(tR.ENWALLET_SHA, D.sha);
+  assert.equal(readFileSync(marker, 'utf8'), markerBytes, 'marker from deploy A lost');
+  assert.equal((await health(p)).sha, D.sha);
+});
+
+test('AC-110-06 env root with a space stays one argument', async () => {
+  const envRoot = mkdtempSync(join(T, 'sf env '));
+  const p = await freePort();
+  const t = deployTraced(envRoot, checkout('110-F'), p);
+  assert.equal(t.argvLen, 4);
+  assert.equal(t.argv[1], join(rootIn(envRoot), 'data'));
+  assert.ok(t.argv[1].includes('sf env '));
+});
