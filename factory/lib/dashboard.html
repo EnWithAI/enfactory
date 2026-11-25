@@ -178,6 +178,9 @@ h2 small { text-transform: none; letter-spacing: 0; font-weight: 500; }
 .witem h3 { grid-column: 1 / -1; margin: 0; font-size: 16px; font-weight: 800; display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
 .witem h3 a { color: var(--fg-3); font-size: 13px; font-weight: 700; }
 .witem .why { font-size: 14px; color: var(--fg-2); min-width: 0; overflow-wrap: anywhere; }
+.witem details.tech { grid-column: 1 / -1; font-size: 13px; color: var(--fg-2); border-top: 1px dashed var(--border); padding-top: 8px; }
+.witem details.tech summary { cursor: pointer; font-weight: 700; color: var(--fg-3); }
+.witem details.tech .md { margin-top: 8px; max-height: 260px; overflow: auto; }
 .witem .why p:first-child { margin-top: 0; }
 .witem .todo h4 { margin: 0 0 6px; font-size: 12px; font-weight: 800; letter-spacing: .5px; text-transform: uppercase; color: var(--fg-3); }
 .witem .todo ol { margin: 0 0 12px; padding-left: 20px; display: flex; flex-direction: column; gap: 6px; font-size: 14px; }
@@ -842,8 +845,8 @@ function renderAsks() {
 }
 
 // ── waiting on you ──
-const KIND = { escalation: ['Decision or approval', 'warn'], vendor: ['Vendor request', 'warn'], owner: ['Owner request', 'info'] };
-const ACTION = { approve: ['Post & approve', true], reply: ['Reply only', false], fulfil: ['Mark fulfilled', true], done: ['Mark done', true], decline: ['Decline', false] };
+const KIND = { escalation: ['Decision or approval', 'warn'], vendor: ['Vendor request', 'warn'], owner: ['Owner request', 'info'], factory: ['Factory code change', 'info'] };
+const ACTION = { approve: ['Post & approve', true], reply: ['Reply only', false], fulfil: ['Mark fulfilled', true], done: ['Mark done', true], decline: ['Decline', false], copy: ['Copy brief for Claude Code', true] };
 const drafts = {};
 let waitSig = '', waitHiddenFor = null; // the set of items the person hid; a new item reopens the section
 $('waiting-hide').onclick = () => { waitHiddenFor = waitSig; $('waiting').hidden = true; $('wait-pill').focus(); };
@@ -893,11 +896,15 @@ function renderWaiting(w) {
     if (i.done) return el('article', { class: 'witem done' }, el('p', {}, `✓ You approved #${i.n} ${i.title}. The org resumes it on its next pass (within a minute) and it leaves this list.`));
     const why = el('div', { class: 'why' });
     why.innerHTML = window.marked && window.DOMPurify ? DOMPurify.sanitize(marked.parse(i.why || '')) : '';
-    const box = el('textarea', { id: `w-${i.n}`, placeholder: i.kind === 'vendor' ? 'Where you put it, e.g. "GitHub secret STRIPE_TEST_KEY". Never the value.' : 'Your answer or decision (optional for approvals)' });
+    const box = el('textarea', { id: `w-${i.n}`, placeholder: i.kind === 'vendor' ? 'Where you put it, e.g. "GitHub secret STRIPE_TEST_KEY". Never the value.' : i.kind === 'factory' ? 'Only needed to decline: say why you do not want this change.' : 'Your answer or decision (optional for approvals)' });
     box.value = drafts[i.n] ?? '';
     box.addEventListener('input', () => { drafts[i.n] = box.value; });
     const msg = el('span', { class: 'msg', role: 'status', 'aria-live': 'polite' });
-    const buttons = i.actions.map((a) => el('button', { type: 'button', class: ACTION[a][1] ? 'primary' : '', onclick: async (e) => {
+    const buttons = i.actions.map((a) => a === 'copy' ? el('button', { type: 'button', class: 'primary', onclick: async () => {
+      // A factory code change: the owner hands the brief to Claude Code rather than doing it in the dashboard.
+      try { await navigator.clipboard.writeText(i.brief); msg.className = 'msg'; msg.textContent = 'Copied. Paste it into Claude Code in the factory folder.'; }
+      catch { msg.className = 'msg err'; msg.textContent = 'The browser blocked copying. Open "What the agents asked for" below and copy it from there.'; }
+    } }, ACTION[a][0]) : el('button', { type: 'button', class: ACTION[a][1] ? 'primary' : '', onclick: async (e) => {
       const btns = e.currentTarget.parentElement.querySelectorAll('button'); btns.forEach((b) => { b.disabled = true; });
       msg.className = 'msg'; msg.textContent = 'Sending to GitHub…';
       try {
@@ -911,6 +918,12 @@ function renderWaiting(w) {
       el('h3', { id: `wt-${i.n}` }, el('span', { class: `pill ${KIND[i.kind][1]}` }, KIND[i.kind][0]), i.title,
         el('a', { href: i.url, target: '_blank', rel: 'noopener' }, `#${i.n} on GitHub`), el('span', { class: 'muted', style: 'font-size:12px;font-weight:600' }, `waiting ${ago(i.since)}`)),
       why,
+      i.detail ? (() => { // the agents' technical spec, for whoever makes the change: out of the way until asked for
+        const d = el('details', { class: 'tech' }, el('summary', {}, i.kind === 'factory' ? 'What the agents asked for (technical)' : 'Details'));
+        const body = el('div', { class: 'md' });
+        body.innerHTML = window.marked && window.DOMPurify ? DOMPurify.sanitize(marked.parse(`${i.detail}${i.source ? `\n\n_${i.source}_` : ''}`)) : '';
+        d.append(body); return d;
+      })() : null,
       el('div', { class: 'todo' }, el('h4', {}, 'What to do'), el('ol', {}, ...i.steps.map((t) => el('li', {}, t))),
         el('label', { for: `w-${i.n}`, class: 'sr' }, 'Your reply'), box, el('div', { class: 'wactions' }, ...buttons, msg)));
   }));

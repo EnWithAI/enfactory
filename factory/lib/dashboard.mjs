@@ -304,10 +304,28 @@ async function loadWaiting(force = false) {
       why: [section(i.body, 'What'), section(i.body, 'Why') && `**Why:** ${section(i.body, 'Why')}`].filter(Boolean).join('\n\n') || i.body?.slice(0, 600),
       steps: [section(i.body, 'How to provide it') || 'Provide what is described above.', 'Never paste a secret here. Say only where you put it (secret name, env var or keychain item).',
         'Click "Mark fulfilled". The request closes and the paused work resumes.'], actions: ['fulfil', 'decline'] });
-    for (const i of own) items.push({ kind: 'owner', n: i.number, title: i.title.replace(/^\[owner\]\s*/, ''), url: i.url, since: i.createdAt,
-      why: [section(i.body, 'What'), section(i.body, 'Why') && `**Why:** ${section(i.body, 'Why')}`].filter(Boolean).join('\n\n') || i.body?.slice(0, 600),
-      steps: ['Decide whether the org should get this change (budgets, permissions, people, environments or factory code are yours).',
-        'If you make the change, click "Mark done" with a note. If not, click "Decline" with the reason, so the org records why.'], actions: ['done', 'decline'] });
+    for (const i of own) {
+      const title = i.title.replace(/^\[owner\]\s*/, ''), body = i.body ?? '';
+      const plain = section(body, 'For you');
+      const spec = body.replace(/## For you\n[\s\S]*?(?=\n## |\n---|$)/, '').replace(/\n---\n[\s\S]*$/, '').trim();
+      const source = body.match(/\n---\n([\s\S]*)$/)?.[1]?.trim() ?? '';
+      // A change to the factory's own code: the owner doesn't write it. Say so, and hand them a brief for Claude Code.
+      if (/factory change requested|factory\/lib|dispatcher\.mjs|checks\.mjs|deploy-gate|\bsf lint\b/i.test(body)) {
+        items.push({ kind: 'factory', n: i.number, title, url: i.url, since: i.createdAt,
+          why: plain || `The agents found a problem in how the factory itself works and propose a change to its code: **${title}**. You don't need to write any code.`,
+          detail: spec, source,
+          brief: `Factory change requested by the org (${repo}#${i.number}: ${title}).\n\n${spec}\n\n${source}\n\nValidate it first: is it still needed, is it safe, and does it fit the factory's design? If yes, make the change with tests, run the full suite (node --test tests/), and close ${repo}#${i.number} with a short note. If not, decline it with the reason.`,
+          steps: ['Click "Copy brief for Claude Code" and paste it into Claude Code in the factory folder (or just ask Claude to handle the owner requests).',
+            'Claude checks whether the change is still needed and safe, makes it with tests, and closes this request with a note.',
+            'Don\'t want it? Click "Decline" with your reason, so the agents learn why.'], actions: ['copy', 'decline'] });
+        continue;
+      }
+      items.push({ kind: 'owner', n: i.number, title, url: i.url, since: i.createdAt,
+        why: plain || [section(body, 'What'), section(body, 'Why') && `**Why:** ${section(body, 'Why')}`].filter(Boolean).join('\n\n') || body.slice(0, 600),
+        detail: plain ? spec : '',
+        steps: ['Decide whether the org should get this: budgets, permissions, people and environments are yours to give.',
+          'If you made the change, click "Mark done" with a one-line note. If not, click "Decline" with the reason, so the org records why.'], actions: ['done', 'decline'] });
+    }
     const E = await import('./engagement.mjs'), es = E.state(), last = E.thread().at(-1);
     if (es && !E.working() && es.phase !== 'delivery' && (es.awaiting || (last && last.from !== 'client' && last.from !== 'system'))) {
       items.push({ kind: 'engagement', n: 0, title: es.awaiting === 'approval' ? `Approve the ${es.phase === 'proposal' ? 'proposal' : 'plan'} in the Client room` : 'The team is waiting for your reply in the Client room',

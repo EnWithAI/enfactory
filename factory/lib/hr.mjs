@@ -94,6 +94,7 @@ export async function review(cfg = loadConfig(), { ids = null } = {}) {
         action: { enum: ['none', 'lesson', 'process_proposal', 'performance_review', 'owner_request'] },
         detail: { type: 'string', description: 'For lesson: the checkable rule for the named role. For process_proposal / owner_request: what should change.' },
         reply: { type: 'string', description: 'The answer to whoever filed it: what was found and what happens now.' },
+        owner_summary: { type: 'string', description: 'For owner_request: one or two plain sentences for the owner, who is not an engineer. What goes wrong today, and what they are being asked for. No file or function names.' },
         fix: (await import('./fixes.mjs')).FIX_SCHEMA }, required: ['id', 'outcome', 'action', 'reply'] } },
       decisions: { type: 'array', items: DECISION } }, required: ['resolutions'] },
     prompt: `# The request and complaint box\nYou handle the org's complaints and requests, like a fair, rigorous HR partner. For each item:\n` +
@@ -135,7 +136,8 @@ export async function review(cfg = loadConfig(), { ids = null } = {}) {
     } else if (res.action === 'process_proposal' && res.detail) {
       M.writeDoc(`org/proposals/${day}-feedback-${item.id}.md`, `# From the feedback box (${item.id})\n${item.kind} from ${item.by} about ${item.about}: ${item.text}\n\n${res.detail}\n`);
     } else if (res.action === 'owner_request' && res.detail) {
-      const f = await T.fileOnce(cfg.product.tracker, { title: `[owner] ${res.detail.slice(0, 80)}`, labels: ['sf-owner-request'], body: `${res.detail}\n\n---\nFrom feedback item ${item.id} (${item.kind} from ${item.by} about ${item.about}).` }).catch(() => null);
+      const forYou = res.owner_summary?.trim() ? `## For you\n${res.owner_summary.trim()}\n\n## Details\n` : '';
+      const f = await T.fileOnce(cfg.product.tracker, { title: `[owner] ${res.detail.slice(0, 80)}`, labels: ['sf-owner-request'], body: `${forYou}${res.detail}\n\n---\nFrom feedback item ${item.id} (${item.kind} from ${item.by} about ${item.about}).` }).catch(() => null);
       if (f) { if (!f.duplicate) await T.assign(cfg.product.tracker, f.n, owners(cfg)).catch(() => {}); done = `owner request #${f.n}${f.duplicate ? ' (merged)' : ''}`; }
     } else if (res.action === 'performance_review' && item.about !== 'org') {
       await import('./coe.mjs').then((C) => C.performanceReview(cfg, item.about, `upheld complaint ${item.id}: ${item.text.slice(0, 300)}`)).catch((e) => { done = `review failed: ${e.message.slice(0, 80)}`; });

@@ -29,6 +29,7 @@ const COE_SCHEMA = (cfg) => {
       lessons: { type: 'array', items: { type: 'object', properties: { role: { enum: [...roles, 'all'] }, lesson: { type: 'string', description: 'A concrete, checkable rule for the future. Not a platitude.' } }, required: ['role', 'lesson'] } },
       actions: { type: 'array', items: { type: 'object', properties: {
         todo: { type: 'string' }, owner_role: { enum: roles }, type: { enum: ACTION_TYPES }, detail: { type: 'string', description: 'The exact text to add (rule, checklist item, prompt clause), or the issue/proposal body.' },
+        owner_summary: { type: 'string', description: 'For factory_change: one or two plain sentences for the owner, who is not an engineer. What goes wrong today, and what the change makes better. No file names, function names or jargon.' },
         priority: { enum: ['P0', 'P1', 'P2', 'P3'] } }, required: ['todo', 'owner_role', 'type', 'detail'] } },
       decisions: { type: 'array', items: DECISION },
     },
@@ -85,7 +86,8 @@ export async function investigate(cfg, ev) {
       const m = await T.createIssue(cfg.product.tracker, { title: a.todo, labels: [cfg.product.intake_label, ...(a.priority ? [a.priority] : [])], body: `${a.detail}\n\n---\nAction item from ${id} on #${n}.` }).catch(() => null);
       status = m ? `filed #${m}` : 'failed to file';
     } else if (a.type === 'factory_change') {
-      const f = await T.fileOnce(cfg.product.tracker, { title: `[owner] ${a.todo}`, labels: ['sf-owner-request'], body: `${a.detail}\n\n---\nFactory change requested by ${id} on #${n}.` }).catch(() => null);
+      const forYou = a.owner_summary?.trim() ? `## For you\n${a.owner_summary.trim()}\n\n## Details\n` : '';
+      const f = await T.fileOnce(cfg.product.tracker, { title: `[owner] ${a.todo}`, labels: ['sf-owner-request'], body: `${forYou}${a.detail}\n\n---\nFactory change requested by ${id} on #${n}.` }).catch(() => null);
       if (f && !f.duplicate) await T.assign(cfg.product.tracker, f.n, owners(cfg)).catch(() => {});
       status = f ? `owner request #${f.n}${f.duplicate ? ' (merged into the existing request)' : ''}` : 'failed to file';
     }

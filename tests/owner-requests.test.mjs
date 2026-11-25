@@ -57,3 +57,9 @@ test('#122: the build is skipped only when every done_when check already holds',
   assert.equal(freshness([], read).allHold, false, 'no checks never skips a build');
 });
 
+
+test('feedback 80bf4988: a design may use factory code without declaring it changes it', () => {
+  const tg = new Dispatcher(cfg).extra('tech-grooming');
+  assert.equal(tg.uses_factory_code.type, 'boolean');
+  assert.match(tg.uses_factory_code.description, /without changing it/);
+});

@@ -186,6 +186,7 @@ export class Dispatcher {
         done_when: { type: 'array', description: 'Machine-checkable end state: after the change, `file` (in `repo`) contains `contains` exactly `count` times. ' +
           'Before each build the dispatcher checks these on the default branch; if all already hold, the work is already done and no build runs (owner request #122).',
           items: { type: 'object', properties: { repo: { enum: [...names, ...(this.factory ? [this.factory.name] : [])] }, file: { type: 'string' }, contains: { type: 'string' }, count: { type: 'number' } }, required: ['file', 'contains', 'count'] } },
+        uses_factory_code: { type: 'boolean', description: 'true when the design runs or reads factory code (e.g. deploy\/local-node.sh) without changing it. Changing it needs factory_paths instead.' },
         delta_of: { type: 'number', description: 'The open issue whose change this one builds on, when both edit the same files. The claims check needs this, or wait/wait_for, or duplicate_of.' },
         duplicate_of: { type: 'number', description: 'The open issue this one duplicates. The product owner confirms before it closes.' },
         ...(this.factory ? { factory_paths: { type: 'array', items: { type: 'string' }, description: `Only for a change to the factory itself (${this.factory.repo}): ` +
@@ -284,7 +285,8 @@ export class Dispatcher {
       if (this.running.has(n) || this.settledSince(n, listedAt)) continue;
       const labels = T.labelsOf(issue);
       if (labels.includes(T.L.working)) await T.editLabels(this.repo, n, { remove: [T.L.working] }); // stale lock after a crash
-      if (labels.includes('sf-waiting-vendor')) { await this.guard(n, () => this.checkVendor(issue)); continue; }
+      // Held for a vendor by the label or by our own record (the label can lag; feedback dde2f5c7): never re-run the stage before the vendor acts.
+      if (labels.includes('sf-waiting-vendor') || M.issueState(n).vendor) { await this.guard(n, () => this.checkVendor(issue)); continue; }
       if (labels.includes(T.L.human)) {
         if (labels.includes(T.L.approved)) await this.resolveGate(issue);
         continue;
@@ -604,8 +606,8 @@ export class Dispatcher {
       const text = this.artifactOf(n, stage, res), bad = [];
       if (!v.repos?.length && !v.factory_paths?.length && !v.all_repos) bad.push('Name the repos this change touches in `repos`, list `factory_paths` for a factory change, or set `all_repos: true`.');
       // The factory's code (not memory/ paths, which every design quotes): its repo slug, or a path into deploy/, factory/, templates/, bin/, tests/.
-      if (this.factory && !v.factory_paths?.length && new RegExp(`\\b${this.factory.repo.replace('/', '\\/')}\\b|software-factory\\/(deploy|factory|templates|bin|tests)\\/`, 'i').test(text))
-        bad.push(`The design names the factory repo, but \`factory_paths\` is empty. List the factory files it edits there.`);
+      if (this.factory && !v.factory_paths?.length && !v.uses_factory_code && new RegExp(`\\b${this.factory.repo.replace('/', '\\/')}\\b|software-factory\\/(deploy|factory|templates|bin|tests)\\/`, 'i').test(text))
+        bad.push(`The design names the factory's code, but \`factory_paths\` is empty. List the factory files it edits there; if it only runs or reads factory code (e.g. deploy/local-node.sh) without changing it, set \`uses_factory_code: true\` instead.`);
       for (const r of this.repos) if (new RegExp(`^\\s*\\**\\s*repos?\\s*:?\\**\\s*:?.*\\b${r.name}\\b`, 'im').test(text) && v.repos?.length && !v.repos.includes(r.name))
         bad.push(`The design's Repo line names ${r.name}, but \`repos\` doesn't include it.`);
       // Two open issues editing the same files must say how they relate (owner request #115; #42 and #64 both wrote local-node.sh).
