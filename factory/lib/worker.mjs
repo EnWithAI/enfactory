@@ -28,7 +28,9 @@ export function verdictSchema(nextOptions, extra = {}) {
   return {
     type: 'object',
     properties: {
-      outcome: { enum: ['advance', 'loop_back', 'reject', 'blocked', 'needs_vendor', 'wait'] },
+      outcome: { enum: ['advance', 'loop_back', 'reject', 'blocked', 'needs_vendor', 'wait', 'already_satisfied'] },
+      satisfied_by: { type: 'string', description: 'With outcome `already_satisfied`: the evidence that the work is already done, as file:lines or a commit sha. ' +
+        'The product owner confirms and the issue closes as completed, with nothing built.' },
       wait_for: { type: 'array', items: { type: 'number' }, description: 'With outcome `wait`: the issue numbers this one depends on, as the plan already says. ' +
         'The issue is parked, with no council, and resumes at this stage once each one has merged or closed.' },
       next_stage: { enum: [...nextOptions, 'blocked'] },

@@ -569,6 +569,26 @@ export class Dispatcher {
     }
     // `reject` means cut (owner request #104, COE on #7). It never routes forward: it closes where `rejected` is an option,
     // and elsewhere the product owner decides the cut; keeping the issue sends it where the agent pointed.
+    // Already done (owner request #144, COE on #71): a stage before build can say the work already exists, with evidence.
+    // The product owner confirms and it closes as completed. No loop, council or empty build.
+    if (v.outcome === 'already_satisfied' && ['analysis', 'feature-grooming', 'tech-grooming'].includes(stage)) {
+      const by = String(v.satisfied_by ?? '').trim();
+      if (!by) { v.outcome = 'blocked'; v.question_for_human = 'already_satisfied needs satisfied_by: the file:lines or commit that already does this.'; }
+      else {
+        if (v.artifact_markdown?.trim()) M.saveArtifact(n, stage, this.artifactOf(n, stage, res));
+        for (const d of v.decisions ?? []) M.decide(d, { actor: role, issue: n });
+        M.record('already_satisfied', { stage, satisfied_by: by.slice(0, 300), summary: v.summary?.slice(0, 300) }, { actor: role, issue: n });
+        const keepTo = st.next.find((s) => s !== 'rejected' && cfg.pipeline[s]) ?? stage;
+        const d = await this.cutDecision(issue, stage, state, `The ${role} found the work already done: ${v.summary} Evidence: ${by}`, keepTo, { done: true });
+        if (d === 'waiting') return;
+        if (d === 'done') {
+          M.record('transition', { stage, to: 'done', outcome: 'already_satisfied', summary: `already satisfied by ${by}`.slice(0, 500), kind: 'already_satisfied' }, { actor: role, issue: n });
+          await T.comment(repo, n, `Closed as already done (evidence: ${by}).`);
+          return this.move(issue, stage, 'done', state);
+        }
+        v.outcome = 'advance'; v.next_stage = keepTo; // the product owner wants it worked on after all
+      }
+    }
     const cut = rejectRoute(st.next, v, stage);
     if (cut) {
       M.record('reject_rerouted', { stage, asked: v.next_stage, allowed: cut.action === 'close' }, { actor: role, issue: n });
@@ -719,6 +739,8 @@ export class Dispatcher {
       const old = T.labelsOf(issue).filter((l) => /^P[0-3]$/.test(l) && l !== v.priority);
       await T.editLabels(repo, n, { add: [v.priority], remove: old });
     }
+    // An advance whose every AC is already satisfied builds nothing: flag it for the weekly report (owner request #145).
+    if (v.outcome === 'advance') { const acLines = (v.artifact_markdown ?? '').split('\n').filter((l) => /\bAC-\d+-\w+/.test(l)); if (acLines.length && acLines.every((l) => /already (satisfied|holds|on main|in place)/i.test(l))) M.record('noop_advance', { stage, to: next, acs: acLines.length }, { actor: role, issue: n }); }
     M.record('transition', { stage, to: next, outcome: v.outcome, loop: isLoop, loops: state.loops, summary: v.summary,
       artifact, adrs, cost_usd: res.cost, council: fromCouncil }, { actor: role, issue: n });
 
@@ -1126,6 +1148,9 @@ export class Dispatcher {
       `> ⚠️ Never paste secrets in this issue. Put them where it says above, then reply with *where* you put them (the name, not the value), and close this issue.` });
     if (!duplicate) await T.assign(this.repo, m, to).catch(() => {});
     M.record('vendor_request', { request: m, title: req.title, blocking, to, duplicate }, { actor: role, issue: n });
+    // The same request asked for again on this issue: nothing new to hand the vendor, so it's waste (owner request #145).
+    if ((state.vendorAsked ??= []).includes(m)) M.record('needs_vendor_repeat', { request: m, stage, times: state.vendorAsked.filter((x) => x === m).length + 1 }, { actor: role, issue: n });
+    state.vendorAsked.push(m); M.saveIssueState(n, state);
     if (blocking) {
       state.vendor = { issue: m, stage, since: now().toISOString() };
       M.saveIssueState(n, state);
@@ -1227,26 +1252,28 @@ export class Dispatcher {
    * The product owner decides a requested cut (owner requests #104, #105): close the issue as not planned, or keep it going
    * to `keepTo`. Returns 'rejected' | keepTo | 'waiting'. A person holding the role gets it as an approval instead.
    */
-  async cutDecision(issue, stage, state, why, keepTo) {
-    const n = issue.number, person = holderOf(this.cfg, 'product-owner');
+  async cutDecision(issue, stage, state, why, keepTo, { done = false } = {}) {
+    // done: the work is already there (owner request #144), so confirming closes it as completed rather than not planned.
+    const n = issue.number, person = holderOf(this.cfg, 'product-owner'), close = done ? 'done' : 'rejected';
     if (person) {
-      await this.escalate(n, state, 'rejected', `**Cut requested at \`${stage}\`.** ${why}\n\nApprove to close #${n} as not planned. To keep it, reply saying so and remove the label; it continues to \`${keepTo}\`.`, [person]);
+      await this.escalate(n, state, close, `**${done ? 'Already done' : 'Cut requested'} at \`${stage}\`.** ${why}\n\nApprove to close #${n} as ${done ? 'completed' : 'not planned'}. To keep it, reply saying so and remove the label; it continues to \`${keepTo}\`.`, [person]);
       return 'waiting';
     }
-    const res = await runAgent({ cfg: this.cfg, role: 'product-owner', issue: n, label: `cut-${stage}`, cwd: HOME,
+    const res = await runAgent({ cfg: this.cfg, role: 'product-owner', issue: n, label: `cut-${done ? 'done-' : ''}${stage}`, cwd: HOME,
       schema: { type: 'object', properties: { cut: { type: 'boolean' }, summary: { type: 'string', description: 'The decision and why, for the issue thread.' },
         decisions: { type: 'array', items: DECISION } }, required: ['cut', 'summary'] },
-      prompt: `${this.context(issue, stage, state, HOME, { kb: 12, reviewing: true })}\n\n# Cut decision\n${why}\n\nYou own scope. Decide now: ` +
-        `**cut** (#${n} closes as not planned, and you tell the client through the account executive if it was in their plan) or **keep** ` +
+      prompt: `${this.context(issue, stage, state, HOME, { kb: 12, reviewing: true })}\n\n# ${done ? 'Already done?' : 'Cut decision'}\n${why}\n\nYou own scope. Decide now: ` +
+        (done ? `**confirm** (set cut: true; #${n} closes as completed with nothing built; check the evidence first) or **keep** `
+          : `**cut** (#${n} closes as not planned, and you tell the client through the account executive if it was in their plan) or **keep** `) +
         `(it continues to \`${keepTo}\`). Weigh the release goal, the client's approved plan and spend. Record the decision.` });
     if (!res.ok) {
       if (!INFRA.test(String(res.error))) await this.escalate(n, state, null, `The product owner couldn't decide a requested cut: ${String(res.error).slice(0, 300)}`);
       return 'waiting';
     }
     for (const d of res.out.decisions ?? []) if (d.title && d.decision) M.decide({ rationale: '', ...d }, { actor: 'product-owner', issue: n });
-    M.record('cut_decided', { stage, cut: res.out.cut, summary: res.out.summary.slice(0, 500), cost_usd: res.cost }, { actor: 'product-owner', issue: n });
-    await T.comment(this.repo, n, `### ${res.out.cut ? '✂️ Cut' : '▶️ Kept'} · product-owner at \`${stage}\`\n${res.out.summary}`);
-    return res.out.cut ? 'rejected' : keepTo;
+    M.record('cut_decided', { stage, cut: res.out.cut, done, summary: res.out.summary.slice(0, 500), cost_usd: res.cost }, { actor: 'product-owner', issue: n });
+    await T.comment(this.repo, n, `### ${res.out.cut ? (done ? '✅ Already done' : '✂️ Cut') : '▶️ Kept'} · product-owner at \`${stage}\`\n${res.out.summary}`);
+    return res.out.cut ? close : keepTo;
   }
 
   /** How a closed issue ended: { reason: COMPLETED | NOT_PLANNED | …, replacement } (from "superseded by #M" / "duplicate of #M"). Cached. */
@@ -1481,7 +1508,7 @@ export class Dispatcher {
         `Don't re-read them or re-run \`gh issue view\` and \`sf memory issue\`. Spend your steps on the work itself; read the full documents only for a specific gap.`,
       lint,
       `\n## Choose next_stage from`, opts,
-      `\nUse \`advance\` to move forward, \`loop_back\` to send work upstream (say exactly what must change in \`handoff\`), \`reject\` to cut the issue (it closes where \`rejected\` is one of your options; elsewhere the product owner decides the cut), \`wait\` with \`wait_for\` when the plan says this issue must wait for other issues (no council; it resumes by itself), and \`blocked\` only when a decision is needed.`,
+      `\nUse \`advance\` to move forward, \`loop_back\` to send work upstream (say exactly what must change in \`handoff\`), \`reject\` to cut the issue (it closes where \`rejected\` is one of your options; elsewhere the product owner decides the cut), \`wait\` with \`wait_for\` when the plan says this issue must wait for other issues (no council; it resumes by itself),, \`already_satisfied\` with \`satisfied_by\` (file:lines or a commit) when the work already exists (before build only; the product owner confirms and it closes as done), and \`blocked\` only when a decision is needed.`,
       `Put the full stage artifact in \`artifact_markdown\`.`,
     ].join('\n');
   }

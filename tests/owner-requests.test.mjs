@@ -63,3 +63,10 @@ test('feedback 80bf4988: a design may use factory code without declaring it chan
   assert.equal(tg.uses_factory_code.type, 'boolean');
   assert.match(tg.uses_factory_code.description, /without changing it/);
 });
+
+test('#144: stages can report work as already done, with evidence', async () => {
+  const { verdictSchema } = await import('../factory/lib/worker.mjs');
+  const s = verdictSchema(['tech-grooming', 'design', 'analysis']);
+  assert.ok(s.properties.outcome.enum.includes('already_satisfied'));
+  assert.match(s.properties.satisfied_by.description, /file:lines or a commit/);
+});

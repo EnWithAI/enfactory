@@ -43,6 +43,15 @@ export function report({ days = 7 } = {}) {
     table(['role', 'runs', 'failed', 'cost', 'avg time'], Object.entries(byRole).map(([k, x]) => [k, x.runs, x.fail, `$${x.cost.toFixed(2)}`, fmt(x.ms / x.runs)])),
     '', '## By stage',
     table(['stage', 'transitions', 'loop-backs', 'routed to'], Object.entries(byStage).map(([k, x]) => [k, x.out, x.loops, Object.entries(x.to).map(([a, b]) => `${a}×${b}`).join(' ')])),
+    '', '## Waste signals (target 0)',
+    // Runs and stages that produced nothing (owner request #145): what the economy and pipeline fixes should drive to zero.
+    table(['signal', 'count', 'issues'], [
+      ['advance with every AC already satisfied (noop_advance)', 'noop_advance'],
+      ['vendor request asked again for the same thing (needs_vendor_repeat)', 'needs_vendor_repeat'],
+      ['found already done before build (already_satisfied)', 'already_satisfied'],
+      ['stage re-run blocked after an advance (redispatch_blocked)', 'redispatch_blocked'],
+      ['duplicate transition ignored (duplicate_transition)', 'duplicate_transition'],
+    ].map(([label, type]) => { const xs = evs.filter((e) => e.type === type); return [label, xs.length, [...new Set(xs.map((e) => `#${e.issue}`))].join(' ') || '–']; })),
     '', '## Escalations',
     escalations.map((e) => `- #${e.issue}: ${e.message?.split('\n')[0]}`).join('\n') || '_none_',
     '', '## Most expensive issues',
