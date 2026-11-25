@@ -119,3 +119,26 @@ test('#133: an unresolvable deploy program holds with missing_config and runs no
   assert.match(d.detail, /executable nope\.sh not found/);
   assert.equal(ran, false, 'no deploy is attempted');
 });
+
+// Owner request #149 (COE on #81): rehearse the deploy in a scratch environment; a failed rehearsal never touches the real one.
+test('#149: a failed scratch deploy makes no real deploy call, and is cleaned up', async () => {
+  const { deployWithPreflight, decideDeploy } = await import('../factory/lib/deploy-gate.mjs');
+  let real = false, cleaned = false;
+  const out = await deployWithPreflight({ runScratch: async () => ({ ok: false, log: 'Error: Cannot find module server/money.mjs' }),
+    runReal: async () => { real = true; return { ok: true }; }, cleanup: async () => { cleaned = true; } });
+  assert.equal(real, false, 'the live environment is not touched');
+  assert.equal(cleaned, true, 'the scratch server and folder are cleaned up');
+  assert.equal(out.preflight, true);
+  assert.match(out.log, /Cannot find module/);
+  const d = await decideDeploy({ verdict: { deploy_now: true, next_stage: 'verify' }, env: 'staging',
+    repos: [{ name: 'enwallet', deploy_command: 'local-node.sh {name} {env} {port}', health: { staging: 'http://127.0.0.1:4310/' } }],
+    runDeploy: async () => out, probe: async () => ({ status: 200 }) });
+  assert.equal(d.status, 'hold'); assert.equal(d.reason, 'preflight_failed');
+});
+
+test('#149: a passing scratch deploy goes on to the real one', async () => {
+  const { deployWithPreflight } = await import('../factory/lib/deploy-gate.mjs');
+  let real = false;
+  const out = await deployWithPreflight({ runScratch: async () => ({ ok: true }), runReal: async () => { real = true; return { ok: true, log: 'live' }; } });
+  assert.equal(real, true); assert.equal(out.ok, true);
+});

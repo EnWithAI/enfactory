@@ -1,4 +1,6 @@
-import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, appendFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, readdirSync, statSync, appendFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { createServer as createNetServer } from 'node:net';
 import path from 'node:path';
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -11,7 +13,7 @@ import { council } from './council.mjs';
 import { report } from './report.mjs';
 import * as R from './repos.mjs';
 import { recordAnswer } from './discovery.mjs';
-import { decideDeploy, probeHealth, deployProgram } from './deploy-gate.mjs';
+import { decideDeploy, probeHealth, deployProgram, deployWithPreflight } from './deploy-gate.mjs';
 
 const now = () => new Date();
 const sh = promisify(execFile);
@@ -1240,12 +1242,31 @@ export class Dispatcher {
       return { ok: w.ok, log: `${r.deploy_workflow} (${env}): ${w.conclusion}${w.url ? ` ${w.url}` : ''}` };
     }
     const base = await R.ensureBase(r); // fresh checkout of the default branch
-    const cmd = r.deploy_command.replaceAll('{name}', r.name).replaceAll('{env}', env).replaceAll('{port}', String(r.ports?.[env] ?? ''));
+    const expand = (port) => r.deploy_command.replaceAll('{name}', r.name).replaceAll('{env}', env).replaceAll('{port}', String(port ?? ''));
     const env_ = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('AWS_')));
-    try {
-      const { stdout, stderr } = await sh('/bin/bash', ['-c', cmd], { cwd: base, env: { ...env_, SF_HOME: HOME, PATH: `${p('deploy')}:${process.env.PATH}` }, timeout: 15 * 60e3, maxBuffer: 32 << 20 });
-      return { ok: true, log: stdout + stderr };
-    } catch (e) { return { ok: false, log: `${e.stdout ?? ''}${e.stderr ?? ''}${e.message}` }; }
+    const run = async (cmd, extra = {}) => {
+      try {
+        const { stdout, stderr } = await sh('/bin/bash', ['-c', cmd], { cwd: base, env: { ...env_, ...extra, SF_HOME: HOME, PATH: `${p('deploy')}:${process.env.PATH}` }, timeout: 15 * 60e3, maxBuffer: 32 << 20 });
+        return { ok: true, log: stdout + stderr };
+      } catch (e) { return { ok: false, log: `${e.stdout ?? ''}${e.stderr ?? ''}${e.message}` }; }
+    };
+    // Rehearse in a scratch environment on a free port first (owner request #149); the live server is touched only if it passes.
+    const scratch = mkdtempSync(path.join(tmpdir(), 'sf-preflight-'));
+    const port = await new Promise((res) => { const s = createNetServer().listen(0, '127.0.0.1', () => { const x = s.address().port; s.close(() => res(x)); }); });
+    return deployWithPreflight({
+      runScratch: async () => {
+        const out = await run(expand(port), { SF_ENV_ROOT: scratch });
+        const serverLog = (() => { try { return readFileSync(path.join(scratch, r.name, env, 'server.log'), 'utf8').slice(-2000); } catch { return ''; } })();
+        return { ok: out.ok, log: `${out.log}${serverLog ? `\n── scratch server.log ──\n${serverLog}` : ''}` };
+      },
+      cleanup: async () => { // stop the scratch server (only a pid serving from the scratch folder) and remove the folder
+        const pidFile = path.join(scratch, r.name, env, 'server.pid');
+        const pid = Number(existsSync(pidFile) ? readFileSync(pidFile, 'utf8').trim() : 0);
+        if (pid) try { if (execFileSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8' }).includes(scratch)) process.kill(pid, 'SIGTERM'); } catch {}
+        rmSync(scratch, { recursive: true, force: true });
+      },
+      runReal: () => run(expand(r.ports?.[env])),
+    });
   }
 
   /**

@@ -5,6 +5,18 @@
 
 const MIN_NOTE = 20; // "n/a" is not a reason; the note is what the verify stage and auditors read
 
+/**
+ * Deploy with a dress rehearsal (owner request #149, COE on #81): run the same deploy into a scratch environment on a free
+ * port first, and touch the real environment only if that passes. A broken release never stops the live server.
+ * runScratch / runReal: async () => { ok, log }; cleanup: async () => void, always called after the scratch run.
+ */
+export async function deployWithPreflight({ runScratch, runReal, cleanup = async () => {} }) {
+  let s;
+  try { s = await runScratch(); } catch (e) { s = { ok: false, log: e.message }; } finally { await cleanup().catch(() => {}); }
+  if (!s?.ok) return { ok: false, preflight: true, log: `preflight_failed: the scratch deploy failed, so the real environment was not touched.\n${String(s?.log ?? '').slice(-2500)}` };
+  return runReal();
+}
+
 /** The program a deploy_command runs: its first word, skipping VAR=value assignments and a `bash`/`sh` wrapper. */
 export function deployProgram(cmd) {
   const words = String(cmd).trim().split(/\s+/).filter((w) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w));
@@ -47,6 +59,7 @@ export async function decideDeploy({ verdict: v, repos, env, runDeploy, probe, r
     try { out = await runDeploy(r, env); } catch (e) { out = { ok: false, log: e.message }; }
     const log = String(out?.log ?? '');
     logs.push(`${r.name}:\n${log.slice(-2500)}`);
+    if (!out?.ok && out?.preflight) return hold('preflight_failed', `The scratch deploy of ${r.name} for ${env} failed, so the real ${env} was not touched.`, { repo: r.name, log: log.slice(-1500) });
     if (!out?.ok) return hold('failed', `The deploy step for ${r.name} to ${env} failed (non-zero exit or missing script).`, { repo: r.name, log: log.slice(-1500) });
     let h;
     try { h = await probe(r.health[env]); } catch (e) { h = { status: 0, error: e.message }; }
