@@ -303,6 +303,7 @@ test('AC-64-03 bad HOST, name, env, port, arg count, flag or SF_ENV_ROOT → exi
     [{}, ['Bad_Name', 'staging', '4400'], /^✗ invalid repo name: Bad_Name/m],
     [{}, ['-x', 'staging', '4400'], /^✗ invalid repo name: -x/m],
     [{}, ['enwallet', 'staging', '80'], /^✗ invalid port: 80 /m],
+    [{}, ['enwallet', 'staging', '1023'], /^✗ invalid port: 1023 /m],
     [{}, ['enwallet', 'staging', '65536'], /^✗ invalid port: 65536 /m],
     [{}, ['enwallet', 'staging', '04310'], /^✗ invalid port: 04310 /m],
     [{}, ['enwallet', 'staging', '4400', '--rollback', 'extra'], /^✗ too many arguments/m],

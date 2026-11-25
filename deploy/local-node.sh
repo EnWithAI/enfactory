@@ -41,7 +41,7 @@ log "── $(ts) $mode $name@$label → $env"
 
 # 4. Port [S6]: no leading zero (bash would read it as octal), 1024-65535.
 [[ -n $port ]] || { [[ $env == staging ]] && port=4310 || port=4311; }
-if ! [[ $port =~ ^[1-9][0-9]{3,4}$ ]] || (( port > 65535 )); then
+if ! [[ $port =~ ^[1-9][0-9]{3,4}$ ]] || (( port < 1024 || port > 65535 )); then
   die 2 "✗ invalid port: $(q "$port") (expected an integer 1024-65535)"
 fi
 log "· port $port"
