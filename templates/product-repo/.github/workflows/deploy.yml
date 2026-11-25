@@ -1,0 +1,59 @@
+# Started by the factory's release-manager (gh workflow run deploy.yml -f environment=<env>) per the go-live policy.
+# AWS access is OIDC → the factory-deploy-<env> role (templates/aws/factory-iam.yaml). No long-lived keys anywhere.
+# Per GitHub Environment (Settings → Environments → staging / production) set:
+#   vars.AWS_DEPLOY_ROLE_ARN, vars.AWS_REGION, vars.HEALTH_URL
+#   Optional: "Required reviewers" on production adds a human approval inside GitHub too.
+name: deploy
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [staging, production]
+        default: staging
+permissions:
+  id-token: write   # OIDC
+  contents: read
+concurrency: { group: deploy-${{ inputs.environment }}, cancel-in-progress: false }
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}   # the OIDC subject the IAM trust policy checks
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Record previous version (for rollback)
+        id: prev
+        run: |
+          # ECS example: echo "taskdef=$(aws ecs describe-services --cluster app-${{ inputs.environment }} --services web --query 'services[0].taskDefinition' --output text)" >> "$GITHUB_OUTPUT"
+          echo "TODO: capture the currently deployed version"
+
+      - name: Deploy
+        run: |
+          # Pick one, matching how this repo deploys today (sf discover documents it in memory/product/repos/<name>.md):
+          #   ECS:     docker build/push to ECR, then aws ecs update-service --force-new-deployment && aws ecs wait services-stable
+          #   Lambda:  aws lambda update-function-code … && aws lambda wait function-updated
+          #   CDK:     npx cdk deploy --require-approval never -c env=${{ inputs.environment }}
+          #   SAM:     sam deploy --config-env ${{ inputs.environment }} --no-confirm-changeset
+          echo "TODO: deploy ${{ github.sha }} to ${{ inputs.environment }}"
+
+      - name: Smoke test
+        run: |
+          for i in $(seq 1 10); do
+            curl -fsS --max-time 10 "${{ vars.HEALTH_URL }}" && exit 0
+            sleep 15
+          done
+          echo "health check failed" && exit 1
+
+      - name: Roll back on failure
+        if: failure()
+        run: |
+          # ECS example: aws ecs update-service --cluster … --service web --task-definition "${{ steps.prev.outputs.taskdef }}"
+          echo "TODO: restore the version captured above"

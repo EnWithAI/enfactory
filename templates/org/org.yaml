@@ -1,0 +1,484 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  Software Factory: organisation definition
+#  This is the one file you edit. Agents read it, and the dispatcher enforces it.
+#  Changes the agents propose land in org/proposals/ for you to review.
+# ─────────────────────────────────────────────────────────────────────────────
+
+company:
+  name: Fintech Studio
+  mission: Build safe, compliant, demonstrable financial software for our clients,
+    one planned release at a time.
+
+product:
+  name: ""
+  tracker: "" # where issues live (one of the repos, or a dedicated issues repo)
+  intake_label: factory # any open issue with this label enters the factory
+  # Every repo that makes up the product, in dependency order (merged and deployed in this order).
+  # `sf discover` studies each repo, and `about` is just a hint for it.
+  repos: []
+
+# Environments, promoted in order. Here they run on the owner's laptop via deploy/local-static.sh.
+# Cloud deploys (GitHub Actions + OIDC → AWS) are supported but out of scope until answers.md says otherwise.
+environments: [ staging, production ]
+aws:
+  region: eu-west-2
+  # Read-only role the SRE/release agents use to validate. One profile, or one per environment (separate accounts):
+  readonly_profile: ""
+
+# Capacity. headcount = how many agents of a role may work in parallel.
+# scale multiplies every headcount, so 1 = small and 2/4 = higher inflow.
+capacity:
+  scale: 1
+  max_parallel: 10 # hard ceiling across all roles
+  poll_seconds: 60
+  budget_usd_per_run: 5 # per agent run (claude --max-budget-usd)
+  daily_budget_usd: 50 # dispatcher stops starting work beyond this
+
+# Quality. Every failure gets a Correction of Errors (5 Whys, fishbone, action items implemented across the team).
+# A role that introduces replace_after_defects defects within window_days goes to a performance review (coach/upgrade/replace).
+quality:
+  coe: true
+  coe_max_per_day: 20
+  replace_after_defects: 3
+  window_days: 7
+  # Spec lint (owner request #51): machine-checked before a feature-grooming spec may advance. Governance can change these.
+  spec_lint:
+    max_acs: 12
+    families:
+      [
+        money,
+        transfer,
+        durability,
+        import,
+        erasure,
+        privacy,
+        free-text,
+        a11y,
+        browser,
+        ux,
+        doc
+      ]
+    verify: [ unit, property, integration, e2e, axe, device, doc ]
+
+# Delivery. Agile releases: one release at a time, each ending in one demoable piece. The product owner plans it,
+# only its issues move past triage, and it closes with release notes, a demo and a retrospective.
+delivery:
+  mode: release # release = one demoable release at a time; flow = everything at once
+  expedite: [ P0 ] # priorities that skip the release gate (production down, data loss, security exposure)
+  focus: []
+
+# Staffing. The CFO agent hires and releases agents within these limits; the budget above is the envelope.
+staffing:
+  wait_minutes: 20 # work waiting this long for a full role triggers a staffing request to the CFO
+  cooldown_minutes: 60 # at most one request per role per cooldown
+  max_headcount_per_role: 8
+  review_hours: 24 # the CFO reviews utilisation and spend this often and may release idle seats
+
+# People. Every role is held by an agent unless a person here holds it. Agents decide within their role
+# and never ask people for decisions. People are asked only for what agents can't do themselves.
+#   roles:  roles this person performs instead of the agent (their stage or approval waits for them)
+#   vendor: provides what agents can't (credentials, accounts, integrations, purchases, legal/physical acts)
+#   owner:  last-resort escalation only (runaway loops, budget, councils that can't decide)
+people: []
+
+# Teams run like FAANG orgs for their domain. During genesis, each lead
+# writes the charter, and the chief of staff writes the operating model.
+teams:
+  product:
+    {
+      lead: product-owner,
+      roles: [ product-owner, prioritizer, analyst, product-manager ]
+    }
+  design: { lead: designer, roles: [ designer ] }
+  engineering: { lead: architect, roles: [ architect, engineer ] }
+  quality: { lead: reviewer, roles: [ reviewer ] }
+  security: { lead: security, roles: [ security ] }
+  sre: { lead: sre, roles: [ release-manager, sre ] }
+  office: { lead: chief-of-staff, roles: [ chief-of-staff, cfo, auditor ] }
+  sales: { lead: account-executive, roles: [ account-executive ] }
+  compliance: { lead: compliance-officer, roles: [ compliance-officer ] }
+
+# Roles: the agent definition lives in .claude/agents/<role>.md
+# tools = what the agent may use without asking (anything else is denied).
+_read:
+  &read [
+    Read,
+    Grep,
+    Glob,
+    "Bash(gh issue view:*)",
+    "Bash(gh issue list:*)",
+    "Bash(gh repo view:*)",
+    "Bash(sf lint:*)",
+    "Bash(gh api -X GET:*)",
+    "Bash(gh label list:*)",
+    "Bash(sf contrast:*)",
+    "Bash(gh search issues:*)",
+    "Bash(ls:*)",
+    "Bash(gh pr view:*)",
+    "Bash(gh pr diff:*)",
+    "Bash(gh pr checks:*)",
+    "Bash(gh run list:*)",
+    "Bash(gh run view:*)",
+    "Bash(sf recall:*)",
+    "Bash(sf memory:*)",
+    "Bash(git log:*)",
+    "Bash(git diff:*)",
+    "Bash(git show:*)",
+    WebSearch,
+    WebFetch
+  ]
+# Tool profiles (owner-defined). Hired roles get one of these; no agent can invent new permissions.
+tool_profiles:
+  read: *read
+  verify: [ Read, Grep, Glob, Bash, WebSearch, WebFetch ]
+  build: [ Read, Grep, Glob, Edit, Write, Bash, WebSearch, WebFetch ]
+
+roles:
+  cfo: { headcount: 1, model: claude-opus-5-5, tools: *read }
+  chief-of-staff: { headcount: 1, model: claude-opus-5-5, tools: *read }
+  auditor: { headcount: 1, model: claude-opus-5-5, tools: *read }
+  product-owner: { headcount: 1, model: claude-opus-5-5, tools: *read }
+  prioritizer: { headcount: 1, model: claude-sonnet-5-5, tools: *read }
+  analyst: { headcount: 1, model: claude-sonnet-5-5, tools: *read }
+  product-manager:
+    {
+      headcount: 2,
+      model: claude-opus-5-5,
+      tools:
+        [
+          Read,
+          Grep,
+          Glob,
+          "Bash(gh issue view:*)",
+          "Bash(sf lint:*)",
+          "Bash(gh issue list:*)",
+          "Bash(gh repo view:*)",
+          "Bash(gh api -X GET:*)",
+          "Bash(gh pr view:*)",
+          "Bash(gh pr diff:*)",
+          "Bash(sf recall:*)",
+          "Bash(sf memory:*)",
+          "Bash(sf contrast:*)",
+          WebSearch,
+          WebFetch,
+          "Write(/{FACTORY}/memory/specs/*/feature-grooming.md)",
+          "Edit(/{FACTORY}/memory/specs/*/feature-grooming.md)"
+        ]
+    } # owner-approved scoped write (request box, 2026-11-25)
+  designer:
+    {
+      headcount: 1,
+      model: claude-opus-5-5,
+      tools:
+        [
+          Read,
+          Grep,
+          Glob,
+          "Bash(gh issue view:*)",
+          "Bash(gh issue list:*)",
+          "Bash(gh repo view:*)",
+          "Bash(gh api -X GET:*)",
+          "Bash(gh pr view:*)",
+          "Bash(gh pr diff:*)",
+          "Bash(sf recall:*)",
+          "Bash(sf memory:*)",
+          "Bash(sf contrast:*)",
+          WebSearch,
+          WebFetch,
+          "Write(/{FACTORY}/memory/specs/*/design/**)",
+          "Edit(/{FACTORY}/memory/specs/*/design/**)"
+        ]
+    } # owner-approved scoped write (request box, 2026-11-25)
+  architect: { headcount: 1, model: claude-opus-5-5, tools: *read }
+  engineer:
+    {
+      headcount: 2,
+      model: claude-opus-5-5,
+      tools: [ Read, Grep, Glob, Edit, Write, Bash, WebSearch, WebFetch ]
+    }
+  reviewer:
+    {
+      headcount: 1,
+      model: claude-opus-5-5,
+      tools: [ Read, Grep, Glob, Bash, WebSearch ]
+    }
+  security:
+    {
+      headcount: 1,
+      model: claude-opus-5-5,
+      tools: [ Read, Grep, Glob, Bash, WebSearch, WebFetch ]
+    }
+  release-manager:
+    {
+      headcount: 1,
+      model: claude-sonnet-5-5,
+      tools: [ Read, Grep, Glob, Bash, WebFetch ]
+    }
+  sre:
+    {
+      headcount: 1,
+      model: claude-sonnet-5-5,
+      # Owner-approved 2026-11-25: Write/Edit only for scratch test scripts (/tmp/sre) and its own verify.md per issue.
+      tools:
+        [
+          Read,
+          Grep,
+          Glob,
+          Bash,
+          WebFetch,
+          "Write(//tmp/sre/**)",
+          "Edit(//tmp/sre/**)",
+          "Write(//private/tmp/sre/**)",
+          "Edit(//private/tmp/sre/**)",
+          "Write(/{FACTORY}/memory/specs/*/verify.md)",
+          "Edit(/{FACTORY}/memory/specs/*/verify.md)"
+        ]
+    }
+  account-executive: { headcount: 1, model: claude-opus-5-5, profile: read }
+  compliance-officer: { headcount: 1, model: claude-opus-5-5, profile: read }
+# aws: true (per role) = the agent runs with AWS_PROFILE=<aws.readonly_profile>. Every other agent has all AWS_* env stripped.
+
+# The pipeline is a state machine. Each issue carries one sf/<stage> label.
+# next lists the only transitions an agent may choose.
+# Moving to an earlier stage counts as a loop. Repeated loops go to a council, never straight to a person.
+pipeline:
+  triage:
+    role: prioritizer
+    goal: Decide priority (P0-P3), dedupe against open work, reject noise.
+    next: [ analysis, rejected ]
+  analysis:
+    role: analyst
+    goal: Understand the problem, users, and current behaviour. Find impact and
+      blast radius in the codebase.
+    next: [ feature-grooming, design, triage, rejected ]
+  design:
+    role: designer
+    goal: Produce UX/UI design. Cover flows, states, copy, and accessibility.
+    next: [ feature-grooming, analysis ]
+  feature-grooming:
+    role: product-manager
+    goal: Write the spec. Include user stories, acceptance criteria
+      (Given/When/Then), non-goals, and success metrics.
+    next: [ tech-grooming, design, analysis ]
+    approve: product-owner # "approve the spec once": by the role, whoever holds it
+    checks: [ spec_lint ] # must pass before the product owner sees it
+  tech-grooming:
+    role: architect
+    goal: Write the technical design. Cover the repos and files touched, cross-repo
+      contracts, data and API changes, test plan, rollout and rollback, and risk
+      tier. List every ADR consequence that requires a doc, charter, memory/,
+      org/ or script edit as an explicit AC or a follow_up_issue in the same
+      verdict (OM-10.7).
+    next: [ build, feature-grooming, design ]
+  build:
+    role: engineer
+    workspace: true
+    goal: Implement the tech design with tests, in every repo it touches (one
+      sub-folder per repo, same branch name). Commit in each. All tests must
+      pass locally.
+    next: [ review, tech-grooming, feature-grooming ]
+  review:
+    role: reviewer
+    workspace: true
+    goal: Review the change like a Google readability reviewer. Check correctness,
+      tests, design, and that every acceptance criterion has evidence, including
+      ACs that carry ADR consequences (OM-10.7). If an ADR the change relies on
+      has a doc/charter/script consequence that is neither an AC nor a filed
+      follow_up_issue, loop back to tech-grooming.
+    next: [ security, build, tech-grooming, feature-grooming ]
+  security:
+    role: security
+    workspace: true
+    goal: Run the security audit. Check the threat model, OWASP issues, secrets, and
+      dependency vulnerabilities (0 critical/high/medium).
+    next: [ merge, build, tech-grooming, feature-grooming ]
+  merge:
+    system: merge # the dispatcher merges once CI is green and the gate is satisfied
+    next: [ release, build ]
+    approve: architect
+  release:
+    role: release-manager
+    goal: Apply the go-live policy to the next environment in order. Choose to
+      deploy now, or hold with a reason.
+    next: [ verify, release ]
+  verify:
+    role: sre
+    goal: "Validate the deploy in the environment it went to: deploy result, health
+      URLs, error signals and CI failures. Record verified_at. Promote to the
+      next environment (release) or finish (done)."
+    next: [ done, release, build ]
+    forward: [ release ] # promoting to the next env is progress, not a loop
+  incident:
+    council:
+      {
+        chair: architect,
+        members: [ sre, engineer, security, product-manager ],
+        rounds: 2
+      }
+    goal: Agents discuss the incident and decide the route. Code fix goes to build,
+      requirement change to feature-grooming, design flaw to tech-grooming.
+    next: [ build, tech-grooming, feature-grooming, analysis, rejected ]
+
+loops:
+  max_loops: 3 # loop-backs before the chief of staff's council takes over routing
+  council_after: 2 # from the 2nd loop-back on, a council picks the route
+  owner_after: 6 # hard stop: only then is the owner pulled in
+
+# Second-person approval by risk tier: auto, or the role that approves (an agent, or the person holding it).
+gates:
+  merge_by_risk: { low: auto, medium: auto, high: architect }
+
+# Go-live policy, which the release-manager applies verbatim.
+release:
+  policy: >-
+    - Always deploy to staging first. Promote to production only after staging
+    verifies clean.
+
+
+    - High risk: promote to production only after staging has run clean for 30
+    minutes. The 30 minutes start at the staging verify's verified_at.
+
+
+    - Rollback may be deployed at any time on SRE recommendation. The rollback
+    target is the most recent SHA that passed both verify-clean and the security
+    gate.
+
+observability:
+  interval_minutes: 15
+  # Commands the SRE agent runs to look for trouble. Add Sentry/Datadog/health checks here.
+  # Run per repo. Placeholders: {repo} {name} {deploy_workflow} {env} {region} {profile}
+  signals:
+    [
+      "gh run list -R {repo} --status failure --limit 10",
+      'curl -fsS -o /dev/null -w "%{http_code} %{time_total}s" {health}',
+      "tail -n 40 ~/factory-envs/{name}/{env}/deploy.log",
+      lsof -nP -iTCP -sTCP:LISTEN
+    ]
+
+discovery:
+  refresh_days: 7 # re-study repos that changed, keeping memory/product/ current
+
+audit:
+  interval_days: 7 # auditor analyses the ledger and proposes process changes
+# Documents library. The org decides these folders (governance can change them); agents publish into them, never elsewhere.
+library:
+  folders:
+    - path: engagement
+      title: Engagement
+      purpose: "The client engagement: brief, proposal, requirements, roadmap, release
+        plan and release cycle. Client-approved versions are the contract for
+        delivery."
+      owner: account-executive
+      doc_types:
+        - brief
+        - proposal
+        - requirements
+        - roadmap
+        - release plan
+        - release cycle
+    - path: compliance
+      title: Compliance and risk
+      purpose: Regulatory scope, risk register, control mapping and audit evidence.
+      owner: compliance-officer
+      doc_types:
+        - regulatory scope
+        - risk register
+        - control mapping
+    - path: architecture
+      title: Architecture
+      purpose: "How the system is built and why: overview, data model, security
+        architecture."
+      owner: architect
+      doc_types:
+        - overview
+        - data model
+        - security architecture
+    - path: product
+      title: Product
+      purpose: Release notes, feature guides and the glossary.
+      owner: product-owner
+      doc_types:
+        - release notes
+        - feature guide
+        - glossary
+    - path: operations
+      title: Operations
+      purpose: Runbooks, environments and incident summaries.
+      owner: sre
+      doc_types:
+        - runbook
+        - incident summary
+# Departments. Teams grouped under a head (an agent role) who reports to the CEO and is the first escalation point. Governance can change this.
+departments:
+  product:
+    title: Product & Design
+    head: product-owner
+    head_title: VP Product (Head of Product & Design)
+    teams:
+      - product
+      - design
+    mandate: "Owns what we build and why, from triage through an approved spec:
+      priority, analysis, UX/copy/design system, acceptance criteria and product
+      bounds. Measured on loop-backs to analysis/design/grooming and on time
+      from triage to approved spec."
+  engineering:
+    title: Engineering
+    head: architect
+    head_title: VP Engineering
+    teams:
+      - engineering
+    mandate: "Owns how it is built: tech design, risk tier, implementation with
+      tests, ledger correctness and on-device data durability through merge.
+      Measured on lead time to merge, PR size compliance and loop-backs from
+      review/security."
+  assurance:
+    title: Assurance (Quality & Security)
+    head: security
+    head_title: Head of Assurance (CISO)
+    teams:
+      - security
+      - quality
+    mandate: "Independent checks on everything engineering ships: code review with
+      AC proof, the test harness, WCAG 2.2 AA, threat model, CSP/privacy policy
+      and 0-critical/high/medium dependency posture. It does not report to the
+      department whose work it checks. Measured on escaped defects, change-fail
+      rate attributable to missed findings, and review/security SLA adherence."
+  reliability:
+    title: Reliability & Release
+    head: sre
+    head_title: VP Site Reliability
+    teams:
+      - sre
+    mandate: "Owns getting changes live safely and keeping them healthy: go-live
+      decisions, staging/production deploys via deploy/local-static.sh,
+      verification, the observability sweep, incidents and freezes. It is
+      separate from engineering so a release can be held without asking the team
+      that built it. Measured on DORA deploy frequency, change-fail rate, MTTR
+      and error budget."
+  office:
+    title: Office of the CEO
+    head: chief-of-staff
+    head_title: Chief of Staff
+    teams:
+      - office
+    mandate: "Owns how the org runs: the operating model, councils, ADR process,
+      freeze register, budget and cost per issue (CFO), and the weekly audit.
+      The auditor reports findings straight to the CEO/owner unedited, with the
+      chief-of-staff as administrative head only, because the audit checks the
+      operating model the chief-of-staff owns."
+  commercial:
+    title: Commercial
+    head: account-executive
+    head_title: Head of Sales
+    teams:
+      - sales
+    mandate: "Wins and owns client engagements: brief, proposal, timeline, budget
+      and the client relationship."
+  risk:
+    title: Risk & Compliance
+    head: compliance-officer
+    head_title: Chief Compliance Officer
+    teams:
+      - compliance
+    mandate: Regulatory compliance (PCI DSS, PSD2/open banking, KYC/AML, GDPR), risk
+      assessments and audit trails. Independent of engineering and security.

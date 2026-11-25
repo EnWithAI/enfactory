@@ -1,0 +1,16 @@
+{
+  "name": "software-factory",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "An organisation of Claude Code agents that turns GitHub issues into shipped software.",
+  "bin": {
+    "sf": "factory/sf.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "yaml": "2.9.1"
+  }
+}

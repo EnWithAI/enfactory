@@ -1,0 +1,111 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Software Factory IAM for one AWS account/environment. It creates the GitHub OIDC trust, a deploy role that only
+  GitHub Actions jobs in the named GitHub Environment can assume, and a read-only role the factory's SRE agents use
+  to validate deploys. Deploy once per account (e.g. staging, production).
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Description: GitHub org or user that owns the product repos
+  RepoPattern:
+    Type: String
+    Default: '*'
+    Description: Repo name or glob (e.g. "web" or "*") allowed to deploy into this account
+  Environment:
+    Type: String
+    AllowedValues: [staging, production]
+    Description: GitHub Environment name. Only jobs that declare this environment can assume the deploy role
+  CreateOIDCProvider:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: Set false if token.actions.githubusercontent.com already exists in this account
+  DeployPolicyArns:
+    Type: CommaDelimitedList
+    Description: Least-privilege managed policies the deploy needs (e.g. your ECS/Lambda/CDK deploy policy)
+  FactoryPrincipalArn:
+    Type: String
+    Description: IAM principal the factory host runs as (user/role ARN) that may assume the read-only role
+
+Conditions:
+  MakeOIDC: !Equals [!Ref CreateOIDCProvider, 'true']
+
+Resources:
+  GitHubOIDC:
+    Type: AWS::IAM::OIDCProvider
+    Condition: MakeOIDC
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+      ThumbprintList: [6938fd4d98bab03faadb97b34396831e3780aea1, 1c58a3a8518e8759bf075b76b750d4f2df264fcd]
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub factory-deploy-${Environment}
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If [MakeOIDC, !Ref GitHubOIDC, !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com']
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}/${RepoPattern}:environment:${Environment}
+      ManagedPolicyArns: !Ref DeployPolicyArns
+
+  FactoryReadOnlyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub factory-readonly-${Environment}
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { AWS: !Ref FactoryPrincipalArn }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchReadOnlyAccess
+        - arn:aws:iam::aws:policy/AWSXrayReadOnlyAccess
+      Policies:
+        - PolicyName: describe-runtime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:Describe*
+                  - ecs:List*
+                  - lambda:GetFunction*
+                  - lambda:List*
+                  - elasticloadbalancing:Describe*
+                  - cloudformation:Describe*
+                  - cloudformation:List*
+                  - apigateway:GET
+                  - rds:Describe*
+                  - autoscaling:Describe*
+                Resource: '*'
+              - Sid: NeverSecretsOrWrites
+                Effect: Deny
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - ssm:GetParameter*
+                  - kms:Decrypt
+                  - s3:GetObject
+                  - iam:*
+                  - sts:AssumeRole
+                Resource: '*'
+
+Outputs:
+  DeployRoleArn:
+    Description: Set as GitHub Environment variable AWS_DEPLOY_ROLE_ARN in each product repo
+    Value: !GetAtt DeployRole.Arn
+  FactoryReadOnlyRoleArn:
+    Description: Use as role_arn of the factory-readonly-<env> AWS CLI profile on the factory host
+    Value: !GetAtt FactoryReadOnlyRole.Arn

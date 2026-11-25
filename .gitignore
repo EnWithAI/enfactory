@@ -1,0 +1,12 @@
+node_modules/
+.DS_Store
+
+# This install's data. Each install has its own; it is versioned separately in .memory.git (see syncMemory),
+# so the factory's code repo never carries a client's project, memory or config.
+/org/
+/memory/
+/library/
+/.memory.git/
+/.factory/
+/workspaces/
+/archive/
