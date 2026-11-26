@@ -101,7 +101,8 @@ export async function runAgent(opts) {
   return { ...fin, cost: first.cost + fin.cost, ms: first.ms + fin.ms, finished_after_cap: true };
 }
 
-function runOnce({ cfg, role, prompt, schema, cwd = HOME, issue = null, label = role, meta = {}, resume = null, budget = null }) {
+// `tools` narrows a run below the role's own tools (a direct owner instruction runs write-capable roles read-only).
+function runOnce({ cfg, role, prompt, schema, cwd = HOME, issue = null, label = role, meta = {}, resume = null, budget = null, tools = null }) {
   const agentsFile = compileAgents(); // per run: newly hired roles are available immediately (immutable, content-addressed)
   const r = cfg.roles[role];
   const pol = taskPolicy(cfg, role, label);
@@ -113,7 +114,7 @@ function runOnce({ cfg, role, prompt, schema, cwd = HOME, issue = null, label = 
     '--output-format', 'stream-json', '--verbose', // stream so the dashboard can show what the agent is doing
     '--json-schema', JSON.stringify(schema),
     '--permission-mode', 'dontAsk',
-    '--allowedTools', (r.tools ?? []).join(','),
+    '--allowedTools', (tools ?? r.tools ?? []).join(','),
     '--add-dir', HOME,
     // Read access to the project's local clone(s); write access still depends on the role's tools.
     ...(cfg.product?.repos ?? []).flatMap((r) => { const b = p('workspaces', r.repo.replace('/', '__')); return existsSync(b) ? ['--add-dir', b] : []; }),

@@ -140,6 +140,18 @@ h2 small { text-transform: none; letter-spacing: 0; font-weight: 500; }
 .chips button { all: unset; cursor: pointer; font-size: 12px; font-weight: 600; padding: 4px 12px; border-radius: 9999px; background: var(--subtle); color: var(--fg-2); }
 .chips button:hover, .chips button:focus-visible { background: var(--border); }
 .answers { display: flex; flex-direction: column; gap: 12px; margin-top: 14px; }
+
+/* a direct instruction to one agent (agent record panel) */
+.instruct { display: flex; flex-direction: column; gap: 8px; border: 1px solid var(--border); border-radius: 14px; padding: 14px 16px; background: var(--subtle); }
+.instruct h2 { margin: 0; }
+.instruct textarea { font: 500 14.5px var(--font); color: var(--fg); background: var(--surface); border: 1px solid var(--border-strong); border-radius: 10px; padding: 10px 12px; resize: vertical; min-height: 64px; }
+.instruct .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.instruct input { width: 96px; font: 500 14px var(--font); color: var(--fg); background: var(--surface); border: 1px solid var(--border-strong); border-radius: 9999px; padding: 7px 12px; }
+.instruct textarea:focus-visible, .instruct input:focus-visible { outline: 2px solid var(--fg); outline-offset: 2px; }
+.instruct button[type=submit] { all: unset; cursor: pointer; font-weight: 700; padding: 8px 20px; border-radius: 9999px; background: var(--ink); color: var(--ink-fg); margin-left: auto; }
+.instruct button[type=submit]:focus-visible { outline: 2px solid var(--fg); outline-offset: 2px; }
+.instruct button[disabled] { opacity: .5; cursor: progress; }
+.instruct .out:empty { display: none; }
 .qa { border-top: 1px solid var(--border); padding-top: 12px; display: flex; flex-direction: column; gap: 8px; }
 .qa .q { font-weight: 800; font-size: 15px; }
 .qa .q span { color: var(--fg-3); font-weight: 600; font-size: 12px; margin-right: 6px; }
@@ -838,8 +850,9 @@ function renderAsks() {
       ? (run ? bubble(run) : el('div', { class: 'quiet' }, 'The chief of staff is starting…'))
       : el('article', { class: 'md' });
     if (a.status !== 'running') body.innerHTML = window.marked && window.DOMPurify ? DOMPurify.sanitize(marked.parse(a.answer ?? '')) : '';
-    return el('div', { class: 'qa' }, el('div', { class: 'q' }, el('span', {}, 'CEO'), a.question), body,
-      a.status === 'done' ? el('div', { class: 'muted', style: 'font-size:12px' }, `Answered by the chief of staff${a.started ? ` · ${ago(a.started)} ago` : ''} · $${(a.cost ?? 0).toFixed(2)}`)
+    const to = a.role && a.role !== 'chief-of-staff' ? pretty(a.role) : null;
+    return el('div', { class: 'qa' }, el('div', { class: 'q' }, el('span', {}, to ? `CEO → ${to}${a.issue ? ` · #${a.issue}` : ''}` : 'CEO'), a.question), body,
+      a.status === 'done' ? el('div', { class: 'muted', style: 'font-size:12px' }, `${to ? `Done by the ${to}` : 'Answered by the chief of staff'}${a.started ? ` · ${ago(a.started)} ago` : ''} · $${(a.cost ?? 0).toFixed(2)}`)
         : ['failed', 'lost', 'unknown'].includes(a.status) ? el('div', { class: 'pill err', style: 'align-self:flex-start' }, 'Not answered') : null);
   }));
 }
@@ -1178,6 +1191,50 @@ function renderOrg() {
 }
 
 // ── agent profile: everything this role has done ──
+// A direct instruction to one role, outside the pipeline. The result shows here, in "Ask the org", and on the issue if one is named.
+function instructBox(role, name, readOnly) {
+  const q = el('textarea', { rows: '3', 'aria-label': `Instruction for ${name}`, placeholder: `e.g. "Check why #5 is still held and tell me exactly what's left"` });
+  const n = el('input', { type: 'number', min: '1', inputmode: 'numeric', 'aria-label': 'Issue number (optional)', placeholder: 'issue #' });
+  const go = el('button', { type: 'submit' }, 'Send');
+  const out = el('div', { class: 'out', 'aria-live': 'polite' });
+  const show = (job) => {
+    const run = lastState?.running.find((r) => r.label === `ceo-${job.id}`);
+    if (job.status === 'running') return out.replaceChildren(run ? bubble(run) : el('div', { class: 'quiet' }, `${name} is starting…`));
+    const body = el('article', { class: 'md' });
+    body.innerHTML = window.marked && window.DOMPurify ? DOMPurify.sanitize(marked.parse(job.answer ?? '')) : '';
+    out.replaceChildren(el('div', { class: 'qa' }, el('div', { class: 'q' }, el('span', {}, 'You'), job.question), body,
+      job.status === 'done' ? el('div', { class: 'muted', style: 'font-size:12px' }, `Done by ${name}${job.issue ? ` · posted on #${job.issue}` : ''} · $${(job.cost ?? 0).toFixed(2)}`)
+        : el('div', { class: 'pill err', style: 'align-self:flex-start' }, 'Not done')));
+  };
+  return el('form', { class: 'instruct', onsubmit: async (e) => {
+    e.preventDefault();
+    const text = q.value.trim(); if (!text) { q.focus(); return; }
+    go.disabled = true;
+    try {
+      const r = await fetch('/api/ask', { method: 'POST', headers: { 'content-type': 'application/json', 'x-factory-ask': '1' }, body: JSON.stringify({ question: text, role, issue: n.value ? Number(n.value) : null }) });
+      const job = await r.json().catch(() => ({}));
+      if (!r.ok || !job.id) throw new Error(job.error ?? `The dashboard server refused it (HTTP ${r.status}).`);
+      q.value = ''; ASKS.unshift(job); show(job);
+      const t = setInterval(async () => {
+        const j = await (await fetch(`/api/ask/${job.id}`)).json().catch(() => null);
+        if (!j) return;
+        Object.assign(job, j); show(job);
+        if (j.status !== 'running') { clearInterval(t); go.disabled = false; }
+      }, 2500);
+    } catch (err) {
+      out.replaceChildren(el('div', { class: 'pill err', style: 'align-self:flex-start' }, err instanceof TypeError ? 'Could not reach the dashboard server.' : err.message));
+      go.disabled = false;
+    }
+  } },
+    el('h2', {}, `Give ${name} an instruction`),
+    q,
+    el('div', { class: 'row' }, n, el('span', { class: 'muted', style: 'font-size:12px' }, 'optional: the result is also posted on that issue'), go),
+    el('div', { class: 'muted', style: 'font-size:12px' }, readOnly
+      ? `Runs right away, outside the pipeline, read-only: ${name} can investigate, answer and file work, but code changes go through build, review and security.`
+      : `Runs right away, outside the pipeline, with ${name}'s usual tools. Work that needs code or config changes is filed as issues.`),
+    out);
+}
+
 async function openAgent(role, seat) {
   $('r-path').textContent = `${role} · agent record`;
   $('r-body').replaceChildren(el('div', { class: 'quiet', style: 'padding:20px 28px' }, 'Loading…'));
@@ -1195,6 +1252,7 @@ async function openAgent(role, seat) {
       el('div', { class: 'tags', style: 'margin-top:6px' }, el('span', { class: 'pill' }, a.team), el('span', { class: 'pill' }, a.model?.replace('claude-', '')),
         el('span', { class: 'pill' }, `${a.seats} seat${a.seats === 1 ? '' : 's'}`), a.generation > 1 ? el('span', { class: 'pill warn' }, `generation ${a.generation}`) : null,
         a.holder ? el('span', { class: 'pill info' }, 'held by a person') : null))),
+    a.holder ? null : instructBox(role, name, a.directReadOnly),
     el('div', { class: 'muted', style: 'font-size:12px' }, 'All seats of a role share one memory, so this record covers the whole role.'),
     el('div', { class: 'stats' }, stat(a.stats.runs, 'runs'), stat(a.stats.failed, 'failed'), stat(`$${a.stats.cost.toFixed(2)}`, 'cost'),
       stat(`${Math.round(a.stats.minutes)}m`, 'time worked'), stat(a.stats.handoffs, 'handoffs'), stat(a.stats.decisions, 'decisions'),

@@ -9,7 +9,7 @@ import { p, loadConfig, configured, paused, setPaused, agentFile, headcount, hol
 import { events, record, writeDoc, decide, kv } from './memory.mjs';
 const kvExtra = () => kv('budget-topups')[new Date().toISOString().slice(0, 10)] ?? 0; // spend the owner approved beyond today's budget
 import { runAgent } from './worker.mjs';
-import { createIssue, gh, humanComment, editLabels, closeIssue, MARK } from './tracker.mjs';
+import { createIssue, gh, humanComment, editLabels, closeIssue, comment, MARK } from './tracker.mjs';
 import { tree as libraryTree } from './library.mjs';
 import { list as feedbackList } from './hr.mjs';
 import { rework as reworkOf } from './rework.mjs';
@@ -194,6 +194,7 @@ function agentProfile(role) {
   const lessons = existsSync(p('memory/lessons', `${role}.md`)) ? readFileSync(p('memory/lessons', `${role}.md`), 'utf8').split('\n').filter(Boolean) : [];
   return {
     role, team: teamOf(cfg, role), model: cfg.roles[role].model, seats: headcount(cfg, role), holder: holderOf(cfg, role),
+    directReadOnly: directTools(cfg, role) !== (cfg.roles[role].tools ?? []), // a direct instruction runs this role read-only
     generation: gens[role]?.gen ?? 1, description: def.match(/^description: (.*)$/m)?.[1]?.replace(/^"|"$/g, '') ?? '',
     stats: { runs: runs.length, failed: runs.filter((r) => !r.ok).length, cost: runs.reduce((s, r) => s + (r.cost_usd ?? 0), 0),
       minutes: runs.reduce((s, r) => s + (r.ms ?? 0), 0) / 60e3, decisions: evs.filter((e) => e.type === 'decision' && e.actor === role).length,
@@ -235,14 +236,29 @@ const ASK_SCHEMA = {
   },
   required: ['answer_markdown'],
 };
-function ask(question) {
+/** Tools for a direct owner instruction: the role's own, except a role that can write anywhere or run any shell command,
+ *  which runs read-only. Code and config changes still go through the pipeline (review, security, merge). */
+export function directTools(cfg, role) {
+  const t = cfg.roles[role]?.tools ?? [];
+  return t.some((x) => x === 'Bash' || x === 'Write' || x === 'Edit') ? (cfg.tool_profiles?.read ?? []) : t;
+}
+const directPrompt = (cfg, role, question, issue) =>
+  `# A direct instruction from the owner, to you as ${role}\n> ${question}\n\n` +
+  (issue ? `It is about #${issue}: read it with \`gh issue view ${issue} -R ${cfg.product.tracker} --comments\` and \`sf memory issue ${issue}\` first.\n` : '') +
+  `This run is outside the pipeline: you are not at a stage, so don't move issues or deploy. Do what is asked within your role, your charter ` +
+  `(${p('org/charters')}) and the tools you have. Research before answering, with real evidence (file paths, issue numbers, command output). ` +
+  `If the instruction needs code, config or product work, file it as follow_up_issues so it goes through the pipeline; a change to how the org ` +
+  `works goes in process_proposal. If something isn't yours to decide, say which role owns it. Report what you did and found, direct answer first.`;
+
+function ask(question, { role = 'chief-of-staff', issue = null } = {}) {
   const cfg = loadConfig();
   const id = randomUUID().slice(0, 8);
-  const job = { id, question, status: 'running', started: new Date().toISOString(), answer: null, cost: 0 };
+  const direct = role !== 'chief-of-staff' || issue;
+  const job = { id, question, role, issue, status: 'running', started: new Date().toISOString(), answer: null, cost: 0 };
   asks.set(id, job); saveAsk(job);
-  record('ceo_question', { question: question.slice(0, 500), ask: id }, { actor: 'ceo' });
-  runAgent({ cfg, role: 'chief-of-staff', label: `ceo-${id}`, schema: ASK_SCHEMA,
-    prompt: `# A question from the CEO\n> ${question}\n\nYou are the chief of staff briefing the CEO. Research before answering. Everything the org knows is on disk: ` +
+  record(direct ? 'owner_instruction' : 'ceo_question', { question: question.slice(0, 500), ask: id, role, issue }, { actor: 'ceo', issue });
+  runAgent({ cfg, role, label: `ceo-${id}`, schema: ASK_SCHEMA, issue, tools: directTools(cfg, role),
+    prompt: direct ? directPrompt(cfg, role, question, issue) : `# A question from the CEO\n> ${question}\n\nYou are the chief of staff briefing the CEO. Research before answering. Everything the org knows is on disk: ` +
       `the ledger (${p('memory/ledger')}: every run, transition, cost, decision, COE), decisions (${p('memory/decisions')}), COEs (${p('memory/coe')}), ` +
       `lessons (${p('memory/lessons')}), issue artifacts (${p('memory/specs')}), product knowledge (${p('memory/product')}), charters and the operating model (${p('org')}), ` +
       `reports (${p('memory/reports')}), and the issue tracker (gh issue/pr view and list on ${cfg.product.tracker}). Use \`sf report\`, \`sf recall\` and \`sf memory issue <n>\`.\n` +
@@ -250,7 +266,7 @@ function ask(question) {
       `If the CEO asks for work, file it (follow_up_issues for product work, process_proposal for how the org works). If they ask for existing backlog work to be done now, ` +
       `list it in pull_into_release. Both join the current release automatically, so never tell the CEO to edit files. Don't do anything else.`,
   }).then(async (r) => {
-    if (!r.ok) { Object.assign(job, { status: 'failed', answer: `The chief of staff could not answer: ${r.error}. Ask again; if it keeps failing, check the factory log.` }); saveAsk(job); return; }
+    if (!r.ok) { Object.assign(job, { status: 'failed', answer: `The ${role} could not finish: ${r.error}. Try again; if it keeps failing, check the factory log.` }); saveAsk(job); return; }
     const filed = [];
     for (const f of r.out.follow_up_issues ?? []) {
       const n = await createIssue(cfg.product.tracker, { title: f.title, labels: [cfg.product.intake_label, ...(f.priority ? [f.priority] : [])], body: `${f.body}\n\n---\nRequested by the CEO: "${question.slice(0, 300)}"` }).catch(() => null);
@@ -267,8 +283,10 @@ function ask(question) {
     if (r.out.process_proposal) writeDoc(`org/proposals/${new Date().toISOString().slice(0, 10)}-ceo-${id}.md`, `# From the CEO\n> ${question}\n\n${r.out.process_proposal}\n`);
     const answer = r.out.answer_markdown + (filed.length ? `\n\n**Filed:** ${filed.map((n) => `#${n}`).join(', ')}` : '') +
       (pulled.length ? `\n\n**Added to the current release:** ${pulled.map((n) => `#${n}`).join(', ')}. The team starts on ${pulled.length > 1 ? 'them' : 'it'} on the next pass.` : '') + (r.out.process_proposal ? '\n\n**Proposed to governance:** a process change (org/proposals).' : '');
-    writeDoc(`memory/threads/ceo/${job.started.slice(0, 10)}-${id}.md`, `# CEO: ${question}\n_${job.started}_\n\n${answer}\n`);
-    record('ceo_answer', { ask: id, cost_usd: r.cost, filed }, { actor: 'chief-of-staff' });
+    writeDoc(`memory/threads/ceo/${job.started.slice(0, 10)}-${id}.md`, `# CEO${direct ? ` → ${role}${issue ? ` (#${issue})` : ''}` : ''}: ${question}\n_${job.started}_\n\n${answer}\n`);
+    record('ceo_answer', { ask: id, cost_usd: r.cost, filed, role }, { actor: role, issue });
+    // On an issue, the instruction and what the role did go on the issue too, so the stage agents see them.
+    if (issue) await comment(cfg.product.tracker, issue, `### 📣 Owner instruction to the ${role}\n> ${question.slice(0, 1500)}\n\n**What the ${role} did:**\n${answer.slice(0, 6000)}`).catch(() => {});
     Object.assign(job, { status: 'done', answer, cost: r.cost }); saveAsk(job);
   }).catch((e) => { Object.assign(job, { status: 'failed', answer: `Something went wrong: ${e.message}. Ask again.` }); saveAsk(job); });
   return job;
@@ -451,9 +469,14 @@ export function serve(port = DEFAULT_PORT, { explicit = false } = {}) {
         // Paid agent runs: accept only same-origin JSON requests from this dashboard (a cross-site page can't send these).
         if (!trusted(req)) { res.statusCode = 403; res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify({ error: 'Refused: questions can only be asked from this dashboard.' })); }
         return body(req).then((b) => {
-          const q = String(JSON.parse(b || '{}').question ?? '').trim();
+          const j = JSON.parse(b || '{}'), q = String(j.question ?? '').trim(), cfg = loadConfig();
+          res.setHeader('content-type', 'application/json');
           if (!q) { res.statusCode = 400; return res.end(JSON.stringify({ error: 'Type a question first.' })); }
-          res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(ask(q.slice(0, 4000))));
+          const role = String(j.role || 'chief-of-staff'), issue = Number(j.issue) || null;
+          if (!cfg.roles[role]) { res.statusCode = 400; return res.end(JSON.stringify({ error: `There is no role called ${role}.` })); }
+          if (holderOf(cfg, role)) { res.statusCode = 400; return res.end(JSON.stringify({ error: `${role} is held by a person (@${holderOf(cfg, role)}), not an agent. Message them directly.` })); }
+          if (issue && (issue < 1 || issue > 1e7)) { res.statusCode = 400; return res.end(JSON.stringify({ error: 'That issue number is not valid.' })); }
+          res.end(JSON.stringify(ask(q.slice(0, 4000), { role, issue })));
         }).catch(() => { res.statusCode = 400; res.end('{}'); });
       }
       if (url.pathname === '/api/engagement' && req.method === 'GET') {
