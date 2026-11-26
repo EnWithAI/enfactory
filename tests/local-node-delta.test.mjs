@@ -183,12 +183,16 @@ test('AC-60-02 node 24 shim exits 1 with "✗ node 26+ required (found 24.0.0)" 
   assert.equal(current(RS), A.sha);
   assert.equal(Number(read(join(RS, 'server.pid'))), pid);
   assert.ok(alive(pid));
-  // 26.0.0 passes the check: the same deploy now builds and goes live.
+  // 26.0.0 passes the version check. Since #192 (S-4) a shim in a temp dir is then refused as an untrusted binary,
+  // still before npm or any stop; the version-pass deploy with a trusted node is covered by every other live deploy.
   const ok = shims('02-26', { nodeVersion: '26.0.0' });
   const r2 = run(['enwallet', 'staging', String(sport)], { cwd: B.dir, env: { PATH: ok.PATH }, R: RS });
-  assert.equal(r2.status, 0, r2.out);
-  assert.ok(ok.count('npm') >= 1);
-  assert.equal((await health(sport)).sha, B.sha);
+  assert.equal(r2.status, 1, r2.out);
+  assert.match(r2.out, /✗ untrusted node binary/);
+  assert.doesNotMatch(r2.out, /node 26\+ required/);
+  assert.equal(ok.count('npm'), 0);
+  assert.equal(current(RS), A.sha);
+  assert.ok(alive(pid));
 });
 
 // ── AC-60-03 ────────────────────────────────────────────────────────────────────────────────────────────────────────────
