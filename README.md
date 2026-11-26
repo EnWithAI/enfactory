@@ -1,8 +1,32 @@
-# Software Factory
+# enfactory: a software company run by AI agents
+
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+![Node 22+](https://img.shields.io/badge/node-22%2B-green.svg)
+![Built on Claude Code](https://img.shields.io/badge/built%20on-Claude%20Code-orange.svg)
 
 An organisation of Claude Code agents. You file GitHub issues, and the org triages, analyses, designs, specs,
 architects, builds, reviews, secures, merges, releases, verifies, and watches production. Every decision is recorded in
 one shared memory, and the org audits and improves its own process.
+
+Every seat is an agent: Head of Sales, product owner, analyst, product manager, designer, architect, engineers, reviewer,
+security, compliance officer, release manager, SRE, CFO, auditor and chief of staff. You are the client and the CEO.
+
+![The factory dashboard: release progress and the agents at their desks](docs/images/dashboard.jpg)
+
+## What happened when we ran it
+
+We gave it a real brief: a consumer payments wallet for India, for an investor demo the next morning, starting from an empty repo.
+In the first 27 hours the org:
+
+- turned a 13-word request into a brief, requirements, a regulatory scope (RBI PPI, KYC/AML, Aadhaar, UPI, DPDP) and 27 planned issues
+- ran 1,002 agent sessions and recorded 1,656 decisions and 857 learnings
+- wrote 20 blameless post-mortems about its own mistakes, and filed complaints about its own rules that became fixes
+- shipped the wallet to staging and production, with iPhone device tests passed
+
+It also overspent its first-day budget, which is why the factory now measures rework by cause and shows spend live.
+See [Cost](#cost-how-the-factory-keeps-token-use-down).
+
+## How work flows
 
 ```
  issue (label: factory)
@@ -274,3 +298,7 @@ proposes changes in `org/proposals/`. You apply what you agree with, and next we
   scoped GitHub token (repo + workflow on the product repo only).
 - The factory never pushes to the default branch. It merges through PRs with CI and gates.
 - Your global rule (latest stable, 0 critical/high/medium vulns) is in the constitution (`CLAUDE.md`), and `security` enforces it.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).

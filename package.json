@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "An organisation of Claude Code agents that turns GitHub issues into shipped software.",
+  "license": "Apache-2.0",
   "bin": {
     "sf": "factory/sf.mjs"
   },
