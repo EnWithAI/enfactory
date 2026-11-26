@@ -263,6 +263,15 @@ h2 small { text-transform: none; letter-spacing: 0; font-weight: 500; }
 .fbform label { font-size: 13px; font-weight: 700; color: var(--fg-2); }
 .fbform select, .fbform input, .fbform textarea { font: 400 14px var(--font); color: var(--fg); background: var(--surface); border: 1px solid var(--border-strong); border-radius: 8px; padding: 8px 10px; min-width: 0; }
 .fbform textarea { min-height: 80px; resize: vertical; }
+@media (max-width: 560px) { .fbform { grid-template-columns: 1fr; } }
+
+/* sign-in: which Claude credential the org and each agent run on */
+#credbox { width: min(820px, 100vw - 32px); }
+.credlist, .credroles { display: flex; flex-direction: column; gap: 8px; }
+.credrow { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; border: 1px solid var(--border); border-radius: 12px; padding: 10px 14px; }
+.credrow b { flex: 1 1 160px; min-width: 0; }
+.credrow select, .authpick select { font: 500 14px var(--font); color: var(--fg); background: var(--surface); border: 1px solid var(--border-strong); border-radius: 8px; padding: 6px 10px; max-width: 100%; }
+.authpick { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .fbform .wactions { grid-column: 2; }
 @media (max-width: 600px) { .fbform { grid-template-columns: 1fr; } .fbform .wactions { grid-column: 1; } }
 .fblist { display: flex; flex-direction: column; gap: 10px; }
@@ -455,6 +464,7 @@ dialog::backdrop { background: var(--scrim); }
   <button type="button" class="askbtn" id="cr-open">Client room<span id="cr-badge" hidden>your turn</span></button>
   <button type="button" class="askbtn ghost" id="fb-open">Feedback box<span id="fb-badge" hidden></span></button>
   <button type="button" class="askbtn ghost" id="org-open">Org chart</button>
+  <button type="button" class="askbtn ghost" id="cred-open">Sign-in</button>
   <button type="button" class="askbtn" id="ask-open">Ask the org<span id="ask-badge" hidden></span></button>
   <span class="live" id="live"><i></i><span>Live</span></span>
 </div></header>
@@ -534,6 +544,19 @@ dialog::backdrop { background: var(--scrim); }
 </div></dialog>
 <dialog id="orgbox" aria-labelledby="org-title"><div class="reader-head"><b id="org-title">Organisation</b><button type="button" id="org-close">Close</button></div>
 <div class="orgwrap"><div class="tree" id="orgtree"></div></div></dialog>
+<dialog id="credbox" aria-labelledby="cred-title"><div class="reader-head"><b id="cred-title">Sign-in · which Claude credential the agents run on</b><button type="button" id="cred-close">Close</button></div>
+<div class="fbwrap">
+  <p class="muted" style="margin:0">Add a subscription token (run <code>claude setup-token</code>) or an Anthropic Console API key. The org default is used by every agent that has no choice of its own; give an agent the same credential or a different one below, or on its record. Secrets stay in <code>~/.config/enfactory/credentials.json</code> on this Mac (readable only by you) and are never shown again, logged or sent to GitHub. With nothing set, agents use this Mac's <code>claude</code> login. Changes apply from each agent's next run.</p>
+  <div><h2>Credentials</h2><div id="cred-list" class="credlist"></div></div>
+  <form id="cred-form" class="fbform" autocomplete="off">
+    <label for="cred-label">Name</label><input id="cred-label" required maxlength="60" placeholder="e.g. Team subscription, Console key">
+    <label for="cred-kind">Type</label><select id="cred-kind"><option value="token">Subscription token (sk-ant-oat…)</option><option value="api_key">API key (sk-ant-api…)</option></select>
+    <label for="cred-secret">Token or key</label><input id="cred-secret" type="password" required autocomplete="new-password" spellcheck="false">
+    <label for="cred-def">Org default</label><label style="font-weight:500"><input id="cred-def" type="checkbox"> make this the org default</label>
+    <div class="wactions"><button type="submit" class="primary">Add</button><span class="msg" id="cred-msg" role="status" aria-live="polite"></span></div>
+  </form>
+  <div><h2>Per agent</h2><div id="cred-roles" class="credroles"></div></div>
+</div></dialog>
 <dialog id="crbox" aria-labelledby="cr-title"><div class="reader-head"><b id="cr-title">Client room</b><button type="button" id="cr-close">Close</button></div>
 <div class="crwrap">
   <ol class="stepper" id="cr-steps" aria-label="Engagement phases"></ol>
@@ -1137,6 +1160,49 @@ $('fb-form').addEventListener('submit', async (e) => {
   } catch (err) { $('fb-msg').className = 'msg err'; $('fb-msg').textContent = `${err.message}. Nothing was filed.`; }
 });
 
+// ── sign-in: the org default credential and each agent's own choice ──
+const credCall = async (method, payload) => {
+  const r = await fetch('/api/credentials', { method, headers: { 'content-type': 'application/json', 'x-factory-ask': '1' }, body: payload ? JSON.stringify(payload) : undefined });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error ?? `The dashboard server refused it (HTTP ${r.status}).`);
+  return j;
+};
+const credName = (c, id) => { const x = c.profiles.find((p) => p.id === id); return x ? `${x.label} (${x.kind === 'token' ? 'token' : 'API key'} ${x.hint})` : null; };
+// One picker: "org default" or a named credential. The same credential can be picked for any number of agents.
+function authSelect(c, role, onchange) {
+  const def = credName(c, c.default) ?? "this Mac's claude login";
+  const sel = el('select', { 'aria-label': `Credential for ${pretty(role)}` }, el('option', { value: '' }, `Org default: ${def}`),
+    ...c.profiles.map((p) => el('option', { value: p.id }, credName(c, p.id))));
+  sel.value = c.agents[role] ?? '';
+  sel.onchange = async () => { sel.disabled = true; try { await credCall('POST', { action: 'assign', role, id: sel.value || null }); onchange?.(); } catch (e) { alertMsg(e.message); } sel.disabled = false; };
+  return sel;
+}
+const alertMsg = (m) => { if (!$('credbox').open) { $('credbox').showModal(); loadCreds(); } $('cred-msg').className = 'msg err'; $('cred-msg').textContent = m; };
+async function loadCreds() {
+  let c; try { c = await credCall('GET'); } catch (e) { $('cred-list').replaceChildren(el('div', { class: 'pill err' }, e.message)); return; }
+  $('cred-list').replaceChildren(...(c.profiles.length ? c.profiles.map((p) => el('div', { class: 'credrow' },
+    el('b', {}, p.label), el('span', { class: 'pill' }, p.kind === 'token' ? 'subscription token' : 'API key'), el('code', {}, p.hint),
+    c.default === p.id ? el('span', { class: 'pill ok' }, 'org default')
+      : el('button', { type: 'button', class: 'askbtn ghost', onclick: async () => { try { await credCall('POST', { action: 'default', id: p.id }); loadCreds(); } catch (e) { alertMsg(e.message); } } }, 'Make default'),
+    el('span', { class: 'muted', style: 'font-size:12px' }, `${Object.values(c.agents).filter((x) => x === p.id).length} agent(s) set to it`),
+    el('button', { type: 'button', class: 'askbtn ghost', onclick: async () => {
+      if (!(await confirmBox({ title: `Remove "${p.label}"?`, body: 'Agents set to it go back to the org default. The secret is deleted from this Mac.', ok: 'Remove', danger: true }))) return;
+      try { await credCall('POST', { action: 'remove', id: p.id }); loadCreds(); } catch (e) { alertMsg(e.message); } } }, 'Remove')))
+    : [el('div', { class: 'quiet' }, "None yet: every agent uses this Mac's claude login.")]),
+    ...(c.default && c.profiles.length ? [el('button', { type: 'button', class: 'link', onclick: async () => { await credCall('POST', { action: 'default', id: null }); loadCreds(); } }, "Use this Mac's claude login as the org default")] : []));
+  const roles = (lastState?.teams ?? []).flatMap((t) => t.roles).filter((r) => !r.holder).map((r) => r.role);
+  $('cred-roles').replaceChildren(...roles.map((role) => el('div', { class: 'credrow' }, el('b', {}, pretty(role)), authSelect(c, role))));
+}
+$('cred-open').onclick = () => { $('cred-msg').textContent = ''; $('credbox').showModal(); loadCreds(); };
+$('cred-close').onclick = () => $('credbox').close();
+$('cred-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  try {
+    await credCall('POST', { action: 'add', label: $('cred-label').value, kind: $('cred-kind').value, secret: $('cred-secret').value, makeDefault: $('cred-def').checked });
+    $('cred-form').reset(); $('cred-msg').className = 'msg ok'; $('cred-msg').textContent = 'Added. It is stored on this Mac only.'; loadCreds();
+  } catch (err) { $('cred-secret').value = ''; alertMsg(err.message); }
+});
+
 // ── org chart: CEO → teams (led by their lead) → roles with one face per seat ──
 $('org-open').onclick = () => {
   renderOrg(); $('orgbox').showModal();
@@ -1253,6 +1319,9 @@ async function openAgent(role, seat) {
         el('span', { class: 'pill' }, `${a.seats} seat${a.seats === 1 ? '' : 's'}`), a.generation > 1 ? el('span', { class: 'pill warn' }, `generation ${a.generation}`) : null,
         a.holder ? el('span', { class: 'pill info' }, 'held by a person') : null))),
     a.holder ? null : instructBox(role, name, a.directReadOnly),
+    a.holder ? null : (() => { const box = el('div', { class: 'authpick' }, el('span', { class: 'muted', style: 'font-size:13px;font-weight:700' }, 'Runs on'));
+      credCall('GET').then((c) => box.append(authSelect(c, role), el('span', { class: 'muted', style: 'font-size:12px' }, 'from its next run · add credentials under Sign-in'))).catch(() => box.remove());
+      return box; })(),
     el('div', { class: 'muted', style: 'font-size:12px' }, 'All seats of a role share one memory, so this record covers the whole role.'),
     el('div', { class: 'stats' }, stat(a.stats.runs, 'runs'), stat(a.stats.failed, 'failed'), stat(`$${a.stats.cost.toFixed(2)}`, 'cost'),
       stat(`${Math.round(a.stats.minutes)}m`, 'time worked'), stat(a.stats.handoffs, 'handoffs'), stat(a.stats.decisions, 'decisions'),

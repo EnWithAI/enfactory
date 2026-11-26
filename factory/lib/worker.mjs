@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { HOME, p, compileAgents } from './config.mjs';
 import { record, saveRun } from './memory.mjs';
 import { save as saveUsage } from './usage.mjs';
+import { profileFor, applyTo } from './credentials.mjs';
 
 const constitution = () => readFileSync(p('CLAUDE.md'), 'utf8');
 const readIf = (f) => { try { return readFileSync(f, 'utf8'); } catch { return ''; } };
@@ -129,6 +130,9 @@ function runOnce({ cfg, role, prompt, schema, cwd = HOME, issue = null, label = 
   const ro = cfg.aws?.readonly_profile;
   if (r.aws && ro) Object.assign(env, { AWS_PROFILE: typeof ro === 'string' ? ro : Object.values(ro).at(-1), AWS_REGION: cfg.aws.region ?? '' });
   else Object.assign(env, { AWS_CONFIG_FILE: '/dev/null', AWS_SHARED_CREDENTIALS_FILE: '/dev/null' }); // defence in depth, not a boundary
+  // The Claude credential for this role: its own, else the org default, else this machine's claude login (set in the dashboard).
+  const auth = profileFor(role);
+  applyTo(env, auth);
   const started = Date.now();
   record('run_started', { role, label, ...meta }, { actor: role, issue });
 
@@ -167,7 +171,7 @@ function runOnce({ cfg, role, prompt, schema, cwd = HOME, issue = null, label = 
       };
       saveRun(issue, label, { role, cwd, prompt, result: res, actions: live.all, stderr: stderr.slice(-4000) });
       record('run_finished', { role, label, ...meta, ok: result.ok, cost_usd: result.cost, ms: result.ms, session: result.session,
-        model: pol.model, effort: pol.effort, resumed: !!resume, capped: result.capped, ...usage,
+        model: pol.model, effort: pol.effort, resumed: !!resume, auth: auth ? `${auth.kind}:${auth.label}` : 'login', capped: result.capped, ...usage,
         error: result.error, denials: result.denials.length }, { actor: role, issue });
       resolve(result);
     });

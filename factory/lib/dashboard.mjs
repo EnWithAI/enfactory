@@ -13,6 +13,7 @@ import { createIssue, gh, humanComment, editLabels, closeIssue, comment, MARK } 
 import { tree as libraryTree } from './library.mjs';
 import { list as feedbackList } from './hr.mjs';
 import { rework as reworkOf } from './rework.mjs';
+import * as creds from './credentials.mjs';
 
 export const DEFAULT_PORT = 4340;
 const list = (dir, ext = '.md') => (existsSync(p(dir)) ? readdirSync(p(dir)).filter((f) => f.endsWith(ext)).sort() : []);
@@ -461,6 +462,19 @@ export function serve(port = DEFAULT_PORT, { explicit = false } = {}) {
       if (url.pathname === '/api/dispatcher' && req.method === 'POST') {
         if (!trusted(req)) return json({ error: 'Refused: only this dashboard can start or pause the org.' }, 403);
         return body(req).then((b) => json(controlDispatcher(JSON.parse(b || '{}').action))).catch((e) => json({ error: e.message }, 400));
+      }
+      // Claude credentials: the org default and per-agent choices. Secrets go in, never out (only a label and the last 4).
+      if (url.pathname === '/api/credentials' && req.method === 'GET') {
+        if (!trusted(req)) return json({ error: 'Refused: credentials are only shown to this dashboard.' }, 403);
+        return json(creds.view());
+      }
+      if (url.pathname === '/api/credentials' && req.method === 'POST') {
+        if (!trusted(req)) return json({ error: 'Refused: credentials can only be changed from this dashboard.' }, 403);
+        return body(req).then((b) => {
+          const a = JSON.parse(b || '{}'), out = creds.change(a, Object.keys(loadConfig().roles));
+          record('credentials_changed', { action: a.action, role: a.role ?? null, kind: a.kind ?? null }, { actor: 'owner' }); // never the secret
+          json(out);
+        }).catch((e) => json({ error: e.message }, 400));
       }
       if (url.pathname === '/api/agent') {
         const prof = agentProfile(url.searchParams.get('role') ?? '');
