@@ -198,6 +198,10 @@ cp -R dist server "$tmp/"
 for d in shared brand; do
   if [[ -d src/$d ]]; then mkdir -p -- "$tmp/src"; cp -R "src/$d" "$tmp/src/"; fi
 done
+# [#177] The server reads its CSP from <release>/deploy/csp.txt at start-up.
+if [[ -f deploy/csp.txt ]]; then
+  log "· copy deploy/csp.txt"; mkdir -p -- "$tmp/deploy"; cp -- deploy/csp.txt "$tmp/deploy/csp.txt"
+fi
 touch "$tmp"
 # [#53] Every relative import in server/, src/shared/ and src/brand/ must resolve inside the staged release.
 # Runs before guard_port/stop_ours/rm/mv, so a failure leaves the live release untouched.
@@ -206,6 +210,11 @@ if ! out=$(node "$here/check-import-closure.mjs" "$tmp"); then
   if [[ -n $out ]]; then while IFS= read -r l; do log "$l"; done <<<"$out"; fi
   rm -rf -- "$tmp"; tmp=""
   die 1 "✗ import closure check failed for $name@$sha; nothing switched"
+fi
+# [#177] A server that reads deploy/csp.txt fails closed without it: abort before touching the live release.
+if grep -rqF -- deploy/csp.txt "$tmp/server" && [[ ! -f $tmp/deploy/csp.txt ]]; then
+  rm -rf -- "$tmp"; tmp=""
+  die 1 "✗ server reads deploy/csp.txt but the release has none for $name@$sha; nothing switched"
 fi
 
 prev=$(readlink "$R/current" 2>/dev/null || true); prev=${prev##*/}
