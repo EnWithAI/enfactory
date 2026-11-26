@@ -13,7 +13,7 @@ import { council } from './council.mjs';
 import { report } from './report.mjs';
 import * as R from './repos.mjs';
 import { recordAnswer } from './discovery.mjs';
-import { decideDeploy, probeHealth, deployProgram, deployWithPreflight } from './deploy-gate.mjs';
+import { decideDeploy, probeHealth, deployProgram, deployWithPreflight, deployEnv, reprobe } from './deploy-gate.mjs';
 
 const now = () => new Date();
 const sh = promisify(execFile);
@@ -892,7 +892,7 @@ export class Dispatcher {
       // Deployed means the deploy step exited 0 AND the health URL answered 200 (feedback 2fa9b900: a repo with no deploy
       // config used to fall out of the loop, so staging was marked deployed and the issue moved to verify with nothing running).
       const env = v.environment ?? this.nextEnv(state);
-      const d = await decideDeploy({ verdict: v, repos: this.deployable(state), env, runDeploy: (r, e) => this.deploy(r, e), probe: (u) => probeHealth(u), resolves: (prog, r) => this.resolvesProgram(prog, r) });
+      const d = await decideDeploy({ verdict: v, repos: this.deployable(state), env, runDeploy: (r, e) => this.deploy(r, e, n), probe: (u) => probeHealth(u), resolves: (prog, r) => this.resolvesProgram(prog, r) });
       for (const [type, data] of d.events) M.record(type, { ...data, risk: state.risk }, { actor: type === 'deploy' ? role : 'deploy', issue: n });
       if (d.status === 'deployed') {
         state.deployed = { ...state.deployed, [env]: now().toISOString() };
@@ -1347,7 +1347,7 @@ export class Dispatcher {
   }
 
   /** Deploy one repo to one environment: a GitHub Actions workflow (cloud) or a local command (this machine). */
-  async deploy(r, env) {
+  async deploy(r, env, n) {
     if (!r.deploy_command) { // dispatching only queues the run; the deploy has "exited 0" when the run concludes success
       const since = now();
       try { await T.runWorkflow(r.repo, r.deploy_workflow, r.default_branch, { environment: env }); }
@@ -1357,7 +1357,7 @@ export class Dispatcher {
     }
     const base = await R.ensureBase(r); // fresh checkout of the default branch
     const expand = (port) => r.deploy_command.replaceAll('{name}', r.name).replaceAll('{env}', env).replaceAll('{port}', String(port ?? ''));
-    const env_ = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('AWS_')));
+    const env_ = deployEnv(process.env); // [#192 S-3] no AWS_ and no test-only supervisor overrides
     const run = async (cmd, extra = {}) => {
       try {
         const { stdout, stderr } = await sh('/bin/bash', ['-c', cmd], { cwd: base, env: { ...env_, ...extra, SF_HOME: HOME, PATH: `${p('deploy')}:${process.env.PATH}` }, timeout: 15 * 60e3, maxBuffer: 32 << 20 });
@@ -1374,13 +1374,29 @@ export class Dispatcher {
         return { ok: out.ok, log: `${out.log}${serverLog ? `\n── scratch server.log ──\n${serverLog}` : ''}` };
       },
       cleanup: async () => { // stop the scratch server (only a pid serving from the scratch folder) and remove the folder
+        await run(`${expand(port)} --stop`, { SF_ENV_ROOT: scratch }); // #192: unload its launchd job first, so nothing relaunches
         const pidFile = path.join(scratch, r.name, env, 'server.pid');
         const pid = Number(existsSync(pidFile) ? readFileSync(pidFile, 'utf8').trim() : 0);
         if (pid) try { if (execFileSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8' }).includes(scratch)) process.kill(pid, 'SIGTERM'); } catch {}
         rmSync(scratch, { recursive: true, force: true });
       },
-      runReal: () => run(expand(r.ports?.[env])),
+      runReal: async () => {
+        const out = await run(expand(r.ports?.[env]));
+        if (out.ok && r.deploy_command.includes('local-node.sh')) { // AC-f (#192): health after the deploy shell exited, and at +60 s
+          await reprobe({ status: () => run(`${expand(r.ports?.[env])} --status`), report: (attempt, s) => this.reportReprobe(r, env, n, attempt, s) });
+        }
+        return out;
+      },
     });
+  }
+
+  /** Log a post-deploy re-probe; a failure gets a ledger event and an issue comment, never an automatic rollback. */
+  async reportReprobe(r, env, n, attempt, s) {
+    let sha = '';
+    try { sha = readFileSync(`${this.envRoot(r, env)}/VERSION`, 'utf8').trim(); } catch {}
+    console.error(`re-probe ${attempt} ${r.name}/${env}@${sha || '?'}: ${s.ok ? 'ok' : 'FAILED'}`);
+    M.record(s.ok ? 'deploy_reprobe' : 'deploy_reprobe_failed', { repo: r.name, env, sha, attempt, log: String(s.log ?? '').slice(-800) }, { actor: 'deploy', issue: n });
+    if (!s.ok && n) await T.comment(this.repo, n, `Re-probe ${attempt} failed on ${env} ${sha}; health one fail = investigate, two = roll back (answers.md watch thresholds)`);
   }
 
   /**

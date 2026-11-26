@@ -17,6 +17,30 @@ export async function deployWithPreflight({ runScratch, runReal, cleanup = async
   return runReal();
 }
 
+// Honoured by deploy/local-node.sh only in test mode (SF_ENV_ROOT set), and never passed to a real deploy (#192, S-3).
+const TEST_ONLY_ENV = new Set(['SF_LAUNCHD_DOMAIN', 'SF_LAUNCHAGENTS_DIR', 'SF_NOW_EPOCH']);
+/** The environment a deploy command gets: no AWS_ credentials, no test-only supervisor overrides. */
+export function deployEnv(src) {
+  return Object.fromEntries(Object.entries(src).filter(([k]) => !k.startsWith('AWS_') && !TEST_ONLY_ENV.has(k)));
+}
+
+/**
+ * AC-f (#192): re-probe once the deploy shell has exited, then again after delayMs. It reports only: a rollback is the
+ * release manager's or SRE's call (answers.md watch thresholds: one failure = investigate, two in a row = roll back).
+ * status: async () => { ok, log }; report: async (attempt, result) => void.
+ */
+export async function reprobe({ status, report, delayMs = 60e3, timer = setTimeout }) {
+  const once = async (attempt) => {
+    let r;
+    try { r = await status(); } catch (e) { r = { ok: false, log: e.message }; }
+    try { await report(attempt, r); } catch { /* reporting never breaks the deploy */ }
+    return r;
+  };
+  const first = await once(1);
+  timer(() => { once(2); }, delayMs)?.unref?.();
+  return first;
+}
+
 /** The program a deploy_command runs: its first word, skipping VAR=value assignments and a `bash`/`sh` wrapper. */
 export function deployProgram(cmd) {
   const words = String(cmd).trim().split(/\s+/).filter((w) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w));

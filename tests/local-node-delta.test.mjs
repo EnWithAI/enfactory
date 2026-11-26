@@ -10,6 +10,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
+import { stopSupervised } from './fixtures/stop-supervised.mjs';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -101,6 +102,7 @@ const stagingStub = async () => {
 after(() => {
   for (const s of stubs) s.child.kill('SIGKILL');
   for (const R of roots) {
+    stopSupervised(R); // #192: unload the launchd job before anything else
     const pid = Number(read(join(R, 'server.pid')));
     if (pid && alive(pid)) process.kill(pid, 'SIGTERM');
   }

@@ -12,6 +12,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
+import { stopSupervised } from './fixtures/stop-supervised.mjs';
 import { fileURLToPath } from 'node:url';
 import { request } from 'node:http';
 import { lstatSync, symlinkSync } from 'node:fs';
@@ -76,6 +77,7 @@ const releases = (R) => readdirSync(join(R, 'releases')).sort();
 
 after(() => {
   for (const R of roots) {
+    stopSupervised(R); // #192: unload the launchd job before anything else
     const pid = Number(read(join(R, 'server.pid')));
     if (pid && alive(pid)) process.kill(pid, 'SIGTERM');
   }
