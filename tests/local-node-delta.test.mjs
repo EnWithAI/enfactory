@@ -193,6 +193,10 @@ test('AC-60-02 node 24 shim exits 1 with "✗ node 26+ required (found 24.0.0)" 
   assert.equal(ok.count('npm'), 0);
   assert.equal(current(RS), A.sha);
   assert.ok(alive(pid));
+  // The version-pass deploy of B (what the shim run did before S-4) now runs with the trusted node; AC-60-03 builds on it.
+  const r3 = run(['enwallet', 'staging', String(sport)], { cwd: B.dir, R: RS });
+  assert.equal(r3.status, 0, r3.out);
+  assert.equal(current(RS), B.sha);
 });
 
 // ── AC-60-03 ────────────────────────────────────────────────────────────────────────────────────────────────────────────
