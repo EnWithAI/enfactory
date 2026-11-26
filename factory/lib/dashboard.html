@@ -1436,7 +1436,8 @@ function renderSpend(s) {
       [usd(sp.all.runs ? sp.all.cost / sp.all.runs : 0), 'average per run'],
       [`${usd(sp.rework.rework)} (${sp.rework.cost ? Math.round((100 * sp.rework.rework) / sp.rework.cost) : 0}%)`,
         `rework today (target 10%): ${Object.entries(sp.rework.causes).filter(([, v]) => v >= 0.5).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${usd(v)}`).join(' · ') || 'none'}` +
-        (sp.rework.continuation >= 0.5 ? ` · plus ${usd(sp.rework.continuation)} continuing after answers (not rework)` : '')]]
+        (sp.rework.continuation >= 0.5 ? ` · plus ${usd(sp.rework.continuation)} continuing after answers (not rework)` : '') +
+        (sp.avoided ? ` · ${sp.avoided} release re-check${sp.avoided > 1 ? 's' : ''} avoided (nothing had changed)` : '')]]
       .map(([b, t]) => el('div', {}, el('b', {}, b), el('span', {}, t))));
   const tabs = SPEND_TABS.filter(([k]) => k !== 'compare' || sp.switched);
   if (!tabs.some(([k]) => k === spendTab)) spendTab = 'role';

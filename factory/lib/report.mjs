@@ -81,6 +81,8 @@ export function report({ days = 7 } = {}) {
       ['stage re-run blocked after an advance (redispatch_blocked)', 'redispatch_blocked'],
       ['duplicate transition ignored (duplicate_transition)', 'duplicate_transition'],
       ['second council on the same stage, sent to the owner instead (council_skipped)', 'council_skipped'],
+      ['release re-check avoided: held and nothing changed (hold_skipped; each one is a run not paid for)', 'hold_skipped'],
+      ['held release re-checked because something changed (hold_woken)', 'hold_woken'],
     ].map(([label, type]) => { const xs = evs.filter((e) => e.type === type); return [label, xs.length, [...new Set(xs.map((e) => `#${e.issue}`))].join(' ') || '–']; })),
     '', '## Escalations',
     escalations.map((e) => `- #${e.issue}: ${e.message?.split('\n')[0]}`).join('\n') || '_none_',

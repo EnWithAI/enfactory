@@ -101,6 +101,8 @@ function spend(evs) {
   })() : [];
   return {
     today: window(since(864e5)), week: window(since(7 * 864e5)), all: window(runs), rework,
+    // Release re-checks the event-driven holds avoided today (one per hour held with nothing changed).
+    avoided: evs.filter((e) => e.type === 'hold_skipped' && e.ts >= new Date().toISOString().slice(0, 10)).length,
     byRole: group(runs, (e) => e.actor).slice(0, 20), byTask: group(runs, (e) => taskOf(e.label)).slice(0, 20),
     switched, compare,
   };

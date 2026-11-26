@@ -135,6 +135,24 @@ export function repeatsAdvance(cfg, state, stage, artifact, events = []) {
 export function duplicateTransition(state, stage, next, outcome) {
   return outcome === 'advance' && stage !== next && state.moved?.from === stage && state.moved.to === next;
 }
+/**
+ * Whether a held release should be re-checked (Release 1: the release manager re-ran 56 times in a day, mostly to say "still
+ * held", and on a timer, so a cleared blocker waited for the next re-check). A hold wakes only when something it could be
+ * waiting for changed. The first look records the baseline. Returns { wake: reason | null, base? }.
+ */
+export function holdWake(h, { updatedAt, open, heads = {}, people = 0, now = new Date() }) {
+  if (!h.base) return { wake: null, base: { updatedAt, watchOpen: Object.fromEntries((h.watch ?? []).map((m) => [m, open.has(m)])), heads } };
+  if (updatedAt && h.base.updatedAt && updatedAt !== h.base.updatedAt) return { wake: 'the issue has new activity (a comment or a label change)' };
+  for (const m of h.watch ?? []) if (h.base.watchOpen[m] !== open.has(m)) return { wake: `#${m} is now ${open.has(m) ? 'open' : 'closed'}` };
+  for (const [r, sha] of Object.entries(heads)) if (sha && h.base.heads?.[r] && sha !== h.base.heads[r]) return { wake: `new code merged on ${r} (${h.base.heads[r].slice(0, 7)} → ${sha.slice(0, 7)})` };
+  if (people > 0) return { wake: 'a person or vendor responded since the hold' };
+  if (h.until && now >= new Date(h.until)) return { wake: 'the time it asked to wait for has passed' };
+  if (now - new Date(h.since) >= 6 * 3600e3) return { wake: 'six hours without a change: a routine re-check' };
+  return { wake: null };
+}
+/** The issue numbers a hold names (what it may be waiting on), other than its own. */
+export const holdWatch = (v, n) => [...new Set(`${v.summary ?? ''} ${v.handoff ?? ''}`.match(/#\d+/g)?.map((x) => Number(x.slice(1))) ?? [])].filter((m) => m && m !== n).slice(0, 20);
+
 /** A tech design's `Touches: ui=y storage=n csp=n` line as booleans; a key that isn't stated is null. */
 export function touchesOf(md) {
   const line = String(md ?? '').match(/^Touches:(.*)$/im)?.[1] ?? '';
@@ -348,6 +366,27 @@ export class Dispatcher {
       if (!st) continue; // done/rejected or a hand-applied label
       const state = M.issueState(n);
       if (this.repeatedAdvance(n, stage, state)) { await this.guard(n, () => this.restoreStage(issue, stage, state)); continue; }
+      // A timer-based hold from before event-driven holds keeps its time and also wakes on events.
+      if (state.holdUntil && !state.hold && T.stageOf(issue) === 'release') { state.hold = { since: now().toISOString(), until: state.holdUntil, watch: [], base: null }; state.holdUntil = null; }
+      if (state.hold) {
+        const heads = {};
+        for (const r of this.deployable(state)) heads[r.name] = await this.headOf(r).catch(() => null);
+        const people = M.events({ since: state.hold.since }).filter((e) => ['person_action', 'answer_recorded', 'vendor_fulfilled', 'human_approved'].includes(e.type)).length;
+        const w = holdWake(state.hold, { updatedAt: issue.updatedAt, open, heads, people, now: now() });
+        if (w.base) { state.hold.base = w.base; M.saveIssueState(n, state); }
+        if (!w.wake) {
+          // One release-manager run avoided per hour held without change (the old timer re-ran it hourly).
+          const last = state.hold.lastSkip ?? state.hold.since;
+          if (!w.base && now() - new Date(last) >= 60 * 60e3) {
+            state.hold.lastSkip = now().toISOString(); M.saveIssueState(n, state);
+            M.record('hold_skipped', { stage, held_since: state.hold.since }, { issue: n });
+          }
+          continue;
+        }
+        M.record('hold_woken', { stage, reason: w.wake, held_since: state.hold.since }, { issue: n });
+        state.lastHandoff = { from: 'hold', by: 'dispatcher', text: `Re-checking the hold because ${w.wake}.` };
+        state.hold = null; M.saveIssueState(n, state);
+      }
       if (state.holdUntil && new Date(state.holdUntil) > now()) continue;
       if (state.waitFor?.length) { // parked on planned dependencies: free until each has merged or closed
         const still = state.waitFor.filter((m) => open.has(m) && !Object.keys(M.issueState(m).merged ?? {}).length);
@@ -550,6 +589,7 @@ export class Dispatcher {
       }
       issue.ci = await this.ciGate(state, 0).catch(() => null); // owner request #50: reviewers see the PR's checks
     }
+    if (stage === 'release') issue.facts = await this.releaseFacts(state).catch(() => '');
     const context = this.context(issue, stage, state, cwd);
 
     let res;
@@ -904,7 +944,9 @@ export class Dispatcher {
         await T.comment(repo, n, `### ⏭️ No deploy to \`${env}\`: the release manager declared no runtime surface\n> ${d.detail.replaceAll('\n', '\n> ')}`);
       } else { // a hold, whether the agent chose it or the gate forced it; never verify
         next = 'release';
-        state.holdUntil = new Date(Date.now() + (v.hold_minutes ?? 60) * 60e3).toISOString();
+        // Woken by events, not a timer (holdWake); a time only when the release manager asked for one (a soak, say).
+        state.hold = { since: now().toISOString(), until: v.hold_minutes ? new Date(Date.now() + v.hold_minutes * 60e3).toISOString() : null, watch: holdWatch(v, n), base: null };
+        state.holdUntil = null;
         if (d.status === 'hold') {
           const text = `The release was held: nothing was deployed to ${env} (${d.reason}).\n${d.detail}${d.log ? `\n\`\`\`\n${d.log.slice(-2500)}\n\`\`\`` : ''}\n` +
             `If the deploy config is missing, file it as a blocking follow-up or a vendor request; if a deploy failed, route the log to build. ` +
@@ -959,11 +1001,14 @@ export class Dispatcher {
       if (!fromCouncil) {
         state.councils = { ...(state.councils ?? {}), [stage]: held + 1 };
         M.saveIssueState(n, state);
-        const lead = cfg.teams[teamOf(cfg, role)]?.lead;
-        const head = Object.values(cfg.departments ?? {}).find((d) => d.teams?.includes(teamOf(cfg, role)))?.head; // first escalation point
+        // Lean: the chair decides from the blocked role's own account (one run). Convening the role, its lead, the department
+        // head and the product owner cost 4-5 runs per routing decision ($15.50 in 80 member runs over 15 hours).
+        const members = cfg.economy?.lean_councils === false
+          ? [...new Set([role, cfg.teams[teamOf(cfg, role)]?.lead, Object.values(cfg.departments ?? {}).find((d) => d.teams?.includes(teamOf(cfg, role)))?.head, 'product-owner'].filter(Boolean))]
+          : [];
         const c = await council({ cfg, name: `issue-${n}/blocked-${stage}-${Date.now()}`, topic: `#${n}: the ${role} is blocked in ${stage}. Decide.`,
           context: `${this.context(issue, stage, state, cwd, { kb: 12, reviewing: true })}\n\n## What blocked the ${role}\n${v.summary}\n\n${v.question_for_human ?? ''}\n${v.handoff}`,
-          chair: 'chief-of-staff', members: [...new Set([role, lead, head, 'product-owner'].filter(Boolean))], rounds: cfg.economy?.council_rounds ?? 2, nextOptions: st.next, issue: n, cwd, extraSchema: this.extra(stage) });
+          chair: 'chief-of-staff', members, rounds: cfg.economy?.council_rounds ?? 2, nextOptions: st.next, issue: n, cwd, extraSchema: this.extra(stage) });
         if (c.ok) return this.apply(issue, stage, c, state, cwd, { fromCouncil: true });
       }
       return this.escalate(n, state, null, `The council could not decide.\n\n${v.question_for_human || v.summary}`, owners(cfg));
@@ -1481,6 +1526,50 @@ export class Dispatcher {
   }
 
   repoByName(name) { return this.repos.find((r) => r.name === name) ?? (this.factory?.name === name ? this.factory : undefined); }
+
+  /** A repo's default-branch head on GitHub, cached for 2 minutes so every held issue in a pass shares one lookup. */
+  async headOf(r) {
+    const c = (this.heads ??= new Map()).get(r.repo);
+    if (c && Date.now() - c.at < 120e3) return c.sha;
+    const sha = await T.gh(['api', `repos/${r.repo}/commits/${r.default_branch}`, '--jq', '.sha']);
+    this.heads.set(r.repo, { sha, at: Date.now() });
+    return sha;
+  }
+
+  /**
+   * The release conditions code can check, so the release manager starts from facts instead of re-deriving them with tool
+   * calls each run: health and build of every environment, the default-branch head, the last verification per environment,
+   * and the latest device-test results people recorded.
+   */
+  async releaseFacts(state) {
+    const lines = [];
+    for (const r of this.deployable(state)) {
+      const head = await this.headOf(r).catch(() => null);
+      if (head) lines.push(`- ${r.name} \`${r.default_branch}\` is at ${head.slice(0, 7)}.`);
+      for (const env of this.envs) {
+        const u = r.health?.[env];
+        if (!u) continue;
+        const got = await fetch(u, { signal: AbortSignal.timeout(3000) }).then(async (x) => `HTTP ${x.status} ${(await x.text()).slice(0, 160)}`).catch(() => 'not answering');
+        lines.push(`- ${r.name} ${env}: ${u} → ${got}`);
+      }
+    }
+    const evs = M.events({ since: new Date(Date.now() - 7 * 864e5).toISOString() });
+    for (const env of this.envs) {
+      const v = evs.filter((e) => e.type === 'verified' && e.env === env).at(-1);
+      if (v) lines.push(`- Last verified on ${env}: ${v.sha} at ${v.ts} (${Math.round((Date.now() - new Date(v.ts)) / 60e3)} min ago).`);
+    }
+    for (const e of evs.filter((x) => x.type === 'vendor_fulfilled').slice(-12).reverse()) {
+      const f = p('memory/knowledge/vendor', `${e.request}.md`);
+      const txt = existsSync(f) ? readFileSync(f, 'utf8') : '';
+      if (!/smoke|iphone|device|android/i.test(txt.split('\n')[0] ?? '')) continue;
+      const body = txt.split('\n').slice(3).join(' ').replace(/\s+/g, ' ').trim();
+      const verdict = body.match(/\b(PASS|FAIL|WAIVE)\b[^.]{0,100}/i)?.[0]; // the result, not other comments on the request
+      const said = (verdict ?? body).slice(0, 120);
+      lines.push(`- Device test #${e.request} (${(txt.split('\n')[0] ?? '').replace(/^# \[vendor\]\s*/, '').slice(0, 90)}): "${said}" at ${e.ts}.`);
+      if (lines.filter((l) => l.startsWith('- Device test')).length >= 3) break;
+    }
+    return lines.join('\n');
+  }
   prList(state) { return Object.entries(state.prs ?? {}).map(([name, pr]) => `${this.repoByName(name).repo}#${pr}`).join(', '); }
   // An environment passed with no_runtime_surface counts as done for promotion, without ever being marked deployed.
   nextEnv(state) { return this.envs.find((e) => !state.deployed?.[e] && !state.noRuntime?.[e]) ?? this.envs.at(-1); }
@@ -1667,6 +1756,10 @@ export class Dispatcher {
       dossier.artifacts.length ? `- Every artifact (older versions too): ${dossier.artifacts.map((a) => p(a)).join(', ')}` : '',
       `- \`sf recall "<keywords>"\` for decisions and learnings from other issues.`,
       st.workspace ? `\n## Workspace (cwd: ${cwd})\nOne sub-folder per repo, each a git worktree on branch \`sf/issue-${n}\`:\n${this.touched(state).map((r) => `- \`${r.name}/\`: ${r.repo} (base \`origin/${r.default_branch}\`)`).join('\n')}\nOnly change repos the tech design names. If another repo must change, loop back to tech-grooming.${state.factory?.paths?.length ? ` Factory commits end with the trailer \`Issue: ${repo}#${n}\`, so the factory repo's history links each change to its issue.` : ''}` : '',
+      stage === 'release' && issue.facts ? `\n## Checked by the dispatcher just now\n${issue.facts}\nUse these facts; don't re-derive them with tool calls.` : '',
+      stage === 'release' ? `\n## If you hold\nYou are run again only when something changes: a comment or label on this issue, an issue you name (#N) opening or ` +
+        `closing, new code on the default branch, a person or vendor responding, or the time you set in \`hold_minutes\` (set it only for a ` +
+        `real timed condition, such as a soak ending). So say exactly what you are waiting for, and name its issue numbers.` : '',
       stage === 'release' ? `\n## Go-live policy\n${cfg.release.policy}\nEnvironments in order: ${this.envs.join(' → ')}. Already deployed: ${JSON.stringify(state.deployed ?? {})}. The next one is **${this.nextEnv(state)}**.${Object.keys(state.noRuntime ?? {}).length ? ` Passed with no runtime surface: ${JSON.stringify(state.noRuntime)}.` : ''}\n` +
         `Deploy config for ${this.nextEnv(state)}:\n${this.deployable(state).map((r) => `- ${r.name}: deploy ${r.deploy_command ? `\`${r.deploy_command}\` (resolves: ${this.resolvesProgram(deployProgram(r.deploy_command), r) ? 'yes' : 'no'})` : r.deploy_workflow || '(none configured)'}, health ${r.health?.[this.nextEnv(state)] || '(none configured)'}`).join('\n')}\n` +
         `The dispatcher marks the environment deployed only if every repo's deploy exits 0 and its health URL answers 200; otherwise the release is held whatever you choose. ` +

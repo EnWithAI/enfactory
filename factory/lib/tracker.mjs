@@ -42,7 +42,7 @@ export const priorityOf = (issue) => labelsOf(issue).find((l) => /^P[0-3]$/.test
 
 export const listIssues = (repo, label) =>
   json(['issue', 'list', '-R', repo, '--label', label, '--state', 'open', '--limit', '500',
-    '--json', 'number,title,body,labels,createdAt,url,milestone']);
+    '--json', 'number,title,body,labels,createdAt,updatedAt,url,milestone']); // updatedAt: a comment or label wakes a held issue
 
 export const listAllOpen = (repo) =>
   json(['issue', 'list', '-R', repo, '--state', 'open', '--limit', '500', '--json', 'number,title,body,labels']);

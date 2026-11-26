@@ -22,7 +22,7 @@ export async function council({ cfg, name, topic, context, chair, members, round
     (t.recommended_next ? `\n**Recommends:** ${t.recommended_next}\n` : '')).join('\n');
 
   record('council_opened', { name, topic, chair, members }, { issue });
-  for (let round = 1; round <= rounds; round++) {
+  for (let round = 1; members.length && round <= rounds; round++) {
     const results = await Promise.all(members.map((role) => runAgent({
       cfg, role, cwd, issue, label: `council-${role}`, schema: nextOptions ? { ...POSITION, properties: { ...POSITION.properties, recommended_next: { enum: nextOptions } } } : POSITION,
       prompt: `# Council: ${topic}\nYou are the ${role} on this council. Chair: ${chair}.\n` +
@@ -42,8 +42,12 @@ export async function council({ cfg, name, topic, context, chair, members, round
   const decision = await runAgent({
     cfg, role: chair, cwd, issue, label: `council-chair`,
     schema: nextOptions ? verdictSchema(nextOptions, extraSchema) : { type: 'object', properties: { summary: { type: 'string' }, ...extraSchema }, required: ['summary'] },
-    prompt: `# Council decision: ${topic}\nYou chair this council. Weigh every member's position and decide.\n` +
-      `Record the decision, the dissent, and why you overruled any member in \`decisions\`.\n\n## Context\n${context}\n\n## Discussion\n${render()}`,
+    prompt: members.length
+      ? `# Council decision: ${topic}\nYou chair this council. Weigh every member's position and decide.\n` +
+        `Record the decision, the dissent, and why you overruled any member in \`decisions\`.\n\n## Context\n${context}\n\n## Discussion\n${render()}`
+      // A lean council: the role that asked has already given its account (in the context); re-running it as a member repeats it.
+      : `# Decision: ${topic}\nYou decide this alone, as ${chair}, from the account in the context. Check the evidence it cites ` +
+        `before you rely on it. Record the decision and why in \`decisions\`. If it truly needs a person, choose \`blocked\`.\n\n## Context\n${context}`,
   });
   const thread = saveThread(name, `# Council: ${topic}\nChair: ${chair} · Members: ${members.join(', ')}\n\n${render()}\n\n## Chair decision\n${decision.out?.summary ?? decision.error}\n`);
   record('council_closed', { name, thread, outcome: decision.out?.outcome, to: decision.out?.next_stage }, { actor: chair, issue });

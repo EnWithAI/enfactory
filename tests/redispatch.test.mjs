@@ -137,3 +137,27 @@ test('#6: a verify bounce over the release-wide CSP header is not the issue\'s d
   assert.deepEqual(r.verdicts.map((t) => t.issue), [3], 'only rulings on the deployed build');
   assert.equal(rulingsOn(evs, 'production'), null);
 });
+
+// Release 1: the release manager re-ran 56 times in a day to say "still held", on a timer, so a cleared blocker (the owner's
+// iPhone PASS, the soak ending) waited for the next re-check. A hold now wakes only when something it could wait for changes.
+test('a held release wakes on a change, not on a timer', async () => {
+  const { holdWake, holdWatch } = await import('../factory/lib/dispatcher.mjs');
+  const since = '2026-11-26T02:31:00Z', at = (m) => new Date(Date.parse(since) + m * 60e3);
+  const open = new Set([2, 27, 177]);
+  const h = { since, until: null, watch: holdWatch({ summary: 'Held: waits for #27 (CSP) and the iPhone smoke on #177.', handoff: '' }, 177), base: null };
+  assert.deepEqual(h.watch, [27], 'its own number is not watched');
+  const first = holdWake(h, { updatedAt: 'u1', open, heads: { enwallet: 'aaa1111' }, now: at(1) });
+  assert.equal(first.wake, null, 'the first look only records the baseline');
+  h.base = first.base;
+  const same = { updatedAt: 'u1', open, heads: { enwallet: 'aaa1111' } };
+  assert.equal(holdWake(h, { ...same, now: at(59) }).wake, null);
+  assert.equal(holdWake(h, { ...same, now: at(180) }).wake, null, 'three hours, nothing changed: no run');
+  assert.match(holdWake(h, { ...same, updatedAt: 'u2', now: at(5) }).wake, /new activity/, 'a comment or label');
+  assert.match(holdWake(h, { ...same, open: new Set([2, 177]), now: at(5) }).wake, /#27 is now closed/);
+  assert.match(holdWake(h, { ...same, heads: { enwallet: 'bbb2222' }, now: at(5) }).wake, /new code merged on enwallet/);
+  assert.match(holdWake(h, { ...same, people: 1, now: at(5) }).wake, /person or vendor/);
+  assert.match(holdWake(h, { ...same, now: at(361) }).wake, /six hours/, 'a routine re-check at most every 6 hours');
+  const timed = { ...h, until: at(29).toISOString() };
+  assert.equal(holdWake(timed, { ...same, now: at(20) }).wake, null);
+  assert.match(holdWake(timed, { ...same, now: at(30) }).wake, /time it asked/, 'a soak it asked to wait for');
+});
