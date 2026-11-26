@@ -800,10 +800,11 @@ export class Dispatcher {
     }
     const filed = [];
     for (const f of v.follow_up_issues ?? []) { // the org files its own work
-      const m = await T.createIssue(repo, { title: f.title, labels: [cfg.product.intake_label, ...(f.priority ? [f.priority] : [])],
-        body: `${f.body}\n\n---\nFiled by **${role}** while working on #${n} (${stage}): ${f.reason}` }).catch(() => null);
+      const { n: m, duplicate } = await T.fileFollowUp(repo, { title: f.title, labels: [cfg.product.intake_label, ...(f.priority ? [f.priority] : [])],
+        body: `${f.body}\n\n---\nFiled by **${role}** while working on #${n} (${stage}): ${f.reason}` }).catch(() => ({ n: null }));
+      if (m && duplicate) M.record('follow_up_deduped', { title: f.title, deduped_to: m, from: n }, { actor: role, issue: m });
       if (m) {
-        filed.push(m); M.record('issue_filed', { title: f.title, filed: m, from: n, blocking: !!f.blocking }, { actor: role, issue: m });
+        filed.push(m); if (!duplicate) M.record('issue_filed', { title: f.title, filed: m, from: n, blocking: !!f.blocking }, { actor: role, issue: m });
         if (f.blocking && cfg.delivery?.mode === 'release') await import('./release.mjs').then((R) => R.admit(cfg, m, { title: f.title, body: f.body, reason: `blocking prerequisite of #${n}: ${f.reason}` })).catch(() => {});
       }
     }

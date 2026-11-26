@@ -100,6 +100,28 @@ export function sameBuildCheck(a, b) {
   return [...shas(b)].some((x) => sa.has(x));
 }
 
+/**
+ * The same piece of work filed again as a follow-up (#187: four CSP tickets in one day). Tuned on real pairs: a shared file
+ * path plus at least 40% title overlap, or near-identical titles, caught 3/4 duplicates and merged 0/4 distinct pairs (#53/#110
+ * share deploy/local-node.sh but are different work; plain text similarity merged 3 of them).
+ */
+export function sameWork(a, b) {
+  const paths = (s) => new Set(s.match(/\b[\w.-]+\/[\w./-]+\.\w+\b/g) ?? []);
+  const words = (s) => new Set(s.toLowerCase().match(/[a-z0-9][a-z0-9./-]{2,}/g) ?? []);
+  const x = words(a.title), y = words(b.title);
+  const overlap = x.size && y.size ? [...x].filter((w) => y.has(w)).length / Math.min(x.size, y.size) : 0;
+  const pb = paths(`${b.title} ${b.body ?? ''}`);
+  const shared = [...paths(`${a.title} ${a.body ?? ''}`)].some((p) => pb.has(p));
+  return overlap >= 0.75 || (shared && overlap >= 0.4);
+}
+/** File a follow-up unless an open issue is already that work; then add the new scope to it. Returns { n, duplicate }. */
+export async function fileFollowUp(repo, { title, body, labels }) {
+  const open = await json(['issue', 'list', '-R', repo, '--state', 'open', '--limit', '300', '--json', 'number,title,body']).catch(() => []);
+  const dup = (open ?? []).find((i) => sameWork({ title, body }, i));
+  if (dup) { await comment(repo, dup.number, `**Same work filed again** (merged here instead of a new issue):\n${title}\n\n${body}`); return { n: dup.number, duplicate: true }; }
+  return { n: await createIssue(repo, { title, body, labels }), duplicate: false };
+}
+
 export async function fileOnce(repo, { title, body, labels }) {
   const open = await json(['issue', 'list', '-R', repo, '--state', 'open', '--label', labels[0], '--limit', '100', '--json', 'number,title,body']).catch(() => []);
   const dup = (open ?? []).find((i) => sameBuildCheck(`${i.title} ${i.body ?? ''}`, `${title} ${body}`)
