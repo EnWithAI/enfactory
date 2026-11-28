@@ -12,6 +12,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
+import { stopSupervised } from './fixtures/stop-supervised.mjs';
 import { fileURLToPath } from 'node:url';
 import { request } from 'node:http';
 import { lstatSync, symlinkSync } from 'node:fs';
@@ -76,6 +77,7 @@ const releases = (R) => readdirSync(join(R, 'releases')).sort();
 
 after(() => {
   for (const R of roots) {
+    stopSupervised(R); // #192: unload the launchd job before anything else
     const pid = Number(read(join(R, 'server.pid')));
     if (pid && alive(pid)) process.kill(pid, 'SIGTERM');
   }
@@ -121,7 +123,9 @@ test('AC-64-02 one listener on 127.0.0.1:<port>, started from current/server/ind
   assert.match(lsof[0], new RegExp(`127\\.0\\.0\\.1:${port} \\(LISTEN\\)`));
   // Re-deploy the same sha with a trace file to read the server's own view of its environment.
   const trace = join(T, 'trace.json');
-  const r = run(['enwallet', 'staging', String(port)], { cwd: A.dir, env: { FIXTURE_TRACE: trace } });
+  writeFileSync(join(R, 'fixture-trace'), trace); // #192: launchd passes no deploy env, so the knob is a root file
+  const r = run(['enwallet', 'staging', String(port)], { cwd: A.dir });
+  rmSync(join(R, 'fixture-trace'), { force: true });
   assert.equal(r.status, 0, r.out);
   const t = JSON.parse(readFileSync(trace, 'utf8'));
   assert.deepEqual(
@@ -509,11 +513,17 @@ test('AC-53-05 rollback to VERIFIED and prune carry src/shared', async () => {
 // #110: #3's server CLI is `server/index.mjs <port> <dataDir>`. The fixture reads the port and data dir from argv only, so
 // these tests go red if the script stops passing them. Each test uses its own SF_ENV_ROOT so the #64 root above is untouched.
 const rootIn = (envRoot) => join(envRoot, 'enwallet', 'staging');
-const deployTraced = (envRoot, repo, p, extra = [], env = {}) => {
+// #192: the launchd-started server gets no deploy env, so the fixture's knobs are files in the env root (fixture-trace,
+// fixture-marker), removed again after the run.
+const deployTraced = (envRoot, repo, p, extra = [], { marker = false } = {}) => {
   const Rx = rootIn(envRoot);
   if (!roots.includes(Rx)) roots.push(Rx);
   const trace = join(T, `trace-${roots.length}-${Math.random().toString(36).slice(2)}.json`);
-  const r = run(['enwallet', 'staging', String(p), ...extra], { cwd: repo?.dir ?? T, R: Rx, env: { SF_ENV_ROOT: envRoot, FIXTURE_TRACE: trace, ...env } });
+  mkdirSync(Rx, { recursive: true, mode: 0o700 });
+  writeFileSync(join(Rx, 'fixture-trace'), trace);
+  if (marker) writeFileSync(join(Rx, 'fixture-marker'), '1');
+  const r = run(['enwallet', 'staging', String(p), ...extra], { cwd: repo?.dir ?? T, R: Rx, env: { SF_ENV_ROOT: envRoot } });
+  for (const f of ['fixture-trace', 'fixture-marker']) rmSync(join(Rx, f), { force: true });
   assert.equal(r.status, 0, r.out);
   return JSON.parse(readFileSync(trace, 'utf8'));
 };
@@ -568,11 +578,11 @@ test('AC-110-05 dataDir persists across deploy and rollback', async () => {
   const p = await freePort();
   const D = checkout('110-D'), E = checkout('110-E');
   const marker = join(Rp, 'data', 'fixture-marker');
-  const tA = deployTraced(envRoot, D, p, [], { FIXTURE_MARKER: '1' });
+  const tA = deployTraced(envRoot, D, p, [], { marker: true });
   const markerBytes = readFileSync(marker, 'utf8');
-  const tB = deployTraced(envRoot, E, p, [], { FIXTURE_MARKER: '1' });
+  const tB = deployTraced(envRoot, E, p, [], { marker: true });
   writeFileSync(join(Rp, 'VERIFIED'), `${D.sha}\n`);
-  const tR = deployTraced(envRoot, null, p, ['--rollback'], { FIXTURE_MARKER: '1' });
+  const tR = deployTraced(envRoot, null, p, ['--rollback'], { marker: true });
   for (const t of [tA, tB, tR]) {
     assert.equal(t.argv[1], join(Rp, 'data'));
     assert.ok(t.argv[1].startsWith('/'), t.argv[1]);

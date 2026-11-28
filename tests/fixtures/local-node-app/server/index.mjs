@@ -10,7 +10,12 @@ const here = dirname(fileURLToPath(import.meta.url));
 const dist = join(here, '..', 'dist');
 let mode = 'ok';
 try { mode = readFileSync(join(here, 'mode'), 'utf8').trim(); } catch {}
-const { HOST, PORT, ENWALLET_DB, ENWALLET_SHA, SF_RELEASE_SHA, FIXTURE_TRACE, FIXTURE_MARKER } = process.env;
+const { HOST, PORT, ENWALLET_DB, ENWALLET_SHA, SF_RELEASE_SHA } = process.env;
+// Test knobs come from control files in the env root (dirname of <dataDir>), not the deploy env: since #192 launchd starts
+// the server with only the contract env, so nothing from the deploying shell reaches it. fixture-trace holds a trace path;
+// fixture-marker (any content) turns the data marker on.
+const knob = (f) => { try { return process.argv[3] ? readFileSync(join(dirname(process.argv[3]), f), 'utf8').trim() : ''; } catch { return ''; } };
+const FIXTURE_TRACE = knob('fixture-trace'), FIXTURE_MARKER = knob('fixture-marker');
 if (FIXTURE_TRACE) {
   writeFileSync(FIXTURE_TRACE, JSON.stringify({
     argv: process.argv.slice(2), argvLen: process.argv.length, argv1: process.argv[1], HOST, PORT, ENWALLET_DB, ENWALLET_SHA, SF_RELEASE_SHA, pid: process.pid,

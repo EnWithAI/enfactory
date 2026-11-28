@@ -10,6 +10,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
+import { stopSupervised } from './fixtures/stop-supervised.mjs';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -101,6 +102,7 @@ const stagingStub = async () => {
 after(() => {
   for (const s of stubs) s.child.kill('SIGKILL');
   for (const R of roots) {
+    stopSupervised(R); // #192: unload the launchd job before anything else
     const pid = Number(read(join(R, 'server.pid')));
     if (pid && alive(pid)) process.kill(pid, 'SIGTERM');
   }
@@ -181,12 +183,20 @@ test('AC-60-02 node 24 shim exits 1 with "✗ node 26+ required (found 24.0.0)" 
   assert.equal(current(RS), A.sha);
   assert.equal(Number(read(join(RS, 'server.pid'))), pid);
   assert.ok(alive(pid));
-  // 26.0.0 passes the check: the same deploy now builds and goes live.
+  // 26.0.0 passes the version check. Since #192 (S-4) a shim in a temp dir is then refused as an untrusted binary,
+  // still before npm or any stop; the version-pass deploy with a trusted node is covered by every other live deploy.
   const ok = shims('02-26', { nodeVersion: '26.0.0' });
   const r2 = run(['enwallet', 'staging', String(sport)], { cwd: B.dir, env: { PATH: ok.PATH }, R: RS });
-  assert.equal(r2.status, 0, r2.out);
-  assert.ok(ok.count('npm') >= 1);
-  assert.equal((await health(sport)).sha, B.sha);
+  assert.equal(r2.status, 1, r2.out);
+  assert.match(r2.out, /✗ untrusted node binary/);
+  assert.doesNotMatch(r2.out, /node 26\+ required/);
+  assert.equal(ok.count('npm'), 0);
+  assert.equal(current(RS), A.sha);
+  assert.ok(alive(pid));
+  // The version-pass deploy of B (what the shim run did before S-4) now runs with the trusted node; AC-60-03 builds on it.
+  const r3 = run(['enwallet', 'staging', String(sport)], { cwd: B.dir, R: RS });
+  assert.equal(r3.status, 0, r3.out);
+  assert.equal(current(RS), B.sha);
 });
 
 // ── AC-60-03 ────────────────────────────────────────────────────────────────────────────────────────────────────────────

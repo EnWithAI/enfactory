@@ -7,6 +7,7 @@ import { createServer as netServer } from 'node:net';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
+import { stopSupervised } from './fixtures/stop-supervised.mjs';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -15,7 +16,9 @@ const FIXTURE = join(here, 'fixtures', 'local-node-app');
 const T = mkdtempSync(join(tmpdir(), 'local-node-177-'));
 const ENV_ROOT = join(T, 'envs');
 const pids = [];
+const roots = new Set();
 after(() => {
+  for (const R of roots) stopSupervised(R); // #192: unload the launchd jobs before anything else
   for (const pid of pids) try { process.kill(pid); } catch {}
   rmSync(T, { recursive: true, force: true });
 });
@@ -48,6 +51,7 @@ const deploy = (name, cwd, port) => {
   delete env.HOST;
   const r = spawnSync('bash', [SCRIPT, name, 'staging', String(port)], { cwd, env, encoding: 'utf8', timeout: 180_000 });
   const R = join(ENV_ROOT, name, 'staging');
+  roots.add(R);
   if (existsSync(join(R, 'server.pid'))) pids.push(Number(readFileSync(join(R, 'server.pid'), 'utf8')));
   return { ...r, out: r.stdout + r.stderr, R };
 };
